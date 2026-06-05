@@ -17,10 +17,12 @@ class FakeAccumulator:
         return self
 
     def Tags(self):
-        return {"scalars": list(self.DATA[self.run_path].keys())}
+        run_data = self.DATA.get(self.run_path, {})
+        return {"scalars": list(run_data.keys())}
 
     def Scalars(self, tag):
-        return self.DATA[self.run_path][tag]
+        run_data = self.DATA.get(self.run_path, {})
+        return run_data.get(tag, [])
 
 
 def _event(step, value, wall_time):
@@ -41,8 +43,13 @@ class TbCliTests(unittest.TestCase):
     def test_parse_selection(self):
         self.assertEqual(tbcli.parse_selection("1,3", 3), [0, 2])
         self.assertEqual(tbcli.parse_selection("all", 3), [0, 1, 2])
+        self.assertEqual(tbcli.parse_selection("ALL", 3), [0, 1, 2])
+        self.assertEqual(tbcli.parse_selection("*", 3), [0, 1, 2])
+        self.assertEqual(tbcli.parse_selection("1,1,2", 3), [0, 1])
         with self.assertRaises(ValueError):
             tbcli.parse_selection("4", 3)
+        with self.assertRaises(ValueError):
+            tbcli.parse_selection("   ", 3)
 
     def test_load_scalars_with_loader(self):
         FakeAccumulator.DATA = {
@@ -55,13 +62,32 @@ class TbCliTests(unittest.TestCase):
 
     def test_render_plot_has_legend(self):
         series = {
-            "run1": [tbcli.ScalarPoint(step=1, value=0.1, wall_time=0), tbcli.ScalarPoint(step=2, value=0.2, wall_time=1)],
-            "run2": [tbcli.ScalarPoint(step=1, value=0.15, wall_time=0), tbcli.ScalarPoint(step=2, value=0.18, wall_time=1)],
+            "run1": [
+                tbcli.ScalarPoint(step=1, value=0.1, wall_time=0),
+                tbcli.ScalarPoint(step=2, value=0.2, wall_time=1),
+            ],
+            "run2": [
+                tbcli.ScalarPoint(step=1, value=0.15, wall_time=0),
+                tbcli.ScalarPoint(step=2, value=0.18, wall_time=1),
+            ],
         }
         plot = tbcli.render_plot(series, width=10, height=4)
         self.assertIn("legend:", plot)
         self.assertIn("run1", plot)
         self.assertIn("run2", plot)
+
+    def test_render_plot_empty_series(self):
+        self.assertEqual(tbcli.render_plot({"run1": []}), "No points to plot.")
+
+    def test_render_plot_with_constant_values(self):
+        series = {
+            "run1": [
+                tbcli.ScalarPoint(step=1, value=0.3, wall_time=0),
+                tbcli.ScalarPoint(step=2, value=0.3, wall_time=1),
+            ]
+        }
+        plot = tbcli.render_plot(series, width=10, height=4)
+        self.assertIn("value range [0.3, 0.3]", plot)
 
 
 if __name__ == "__main__":

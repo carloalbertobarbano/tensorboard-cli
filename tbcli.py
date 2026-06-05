@@ -35,9 +35,9 @@ def _event_accumulator():
         from tensorboard.backend.event_processing.event_accumulator import (
             EventAccumulator,
         )
-    except Exception as exc:  # pragma: no cover - environment dependent
+    except ImportError as exc:  # pragma: no cover - environment dependent
         raise RuntimeError(
-            "tensorboard is required. Install it with: pip install tensorboard"
+            "tensorboard is required. Install it with: pip install 'tensorboard>=2.0'"
         ) from exc
     return EventAccumulator
 
@@ -54,7 +54,11 @@ def load_scalars(
         loaded[str(run)] = {}
         for tag in tags:
             points = [
-                ScalarPoint(step=int(event.step), value=float(event.value), wall_time=float(event.wall_time))
+                ScalarPoint(
+                    step=int(event.step),
+                    value=float(event.value),
+                    wall_time=float(event.wall_time),
+                )
                 for event in acc.Scalars(tag)
             ]
             loaded[str(run)][tag] = points
@@ -62,14 +66,11 @@ def load_scalars(
 
 
 def parse_selection(raw: str, total: int) -> List[int]:
-    text = raw.strip().lower()
-    if text in {"all", "*"}:
+    tokens = [token.strip() for token in raw.split(",") if token.strip()]
+    if any(token.lower() in {"all", "*"} for token in tokens):
         return list(range(total))
     selected = []
-    for token in raw.split(","):
-        token = token.strip()
-        if not token:
-            continue
+    for token in tokens:
         idx = int(token) - 1
         if idx < 0 or idx >= total:
             raise ValueError(f"Invalid index: {token}")
@@ -84,11 +85,11 @@ def prompt_run_selection(runs: Sequence[Path]) -> List[Path]:
     for idx, run in enumerate(runs, start=1):
         print(f"  [{idx}] {run}")
     while True:
-        raw = input("Select runs (e.g. 1,2 or all): ")
+        raw = input("Select runs (e.g. 1,2 or all/*): ")
         try:
             indexes = parse_selection(raw, len(runs))
             return [runs[i] for i in indexes]
-        except Exception as exc:
+        except ValueError as exc:
             print(f"Invalid selection: {exc}")
 
 
@@ -103,7 +104,7 @@ def prompt_metric_selection(metrics: Sequence[str]) -> str:
             if idx < 0 or idx >= len(metrics):
                 raise ValueError
             return metrics[idx]
-        except Exception:
+        except ValueError:
             print("Invalid metric selection")
 
 
@@ -143,7 +144,7 @@ def clear_terminal() -> None:
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Minimal TensorBoard log viewer")
     parser.add_argument("logdir", help="TensorBoard log directory")
-    parser.add_argument("--runs", help="Comma-separated run indexes to preselect")
+    parser.add_argument("--runs", help="Comma-separated run indexes or all/*")
     parser.add_argument("--metric", help="Metric tag to preselect")
     parser.add_argument("--refresh", type=float, default=5.0, help="Auto-refresh interval seconds")
     parser.add_argument("--once", action="store_true", help="Render once and exit")
@@ -153,7 +154,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 def _resolve_selected_runs(all_runs: List[Path], run_arg: Optional[str]) -> List[Path]:
     if not all_runs:
-        raise RuntimeError("No TensorBoard runs found in the specified folder.")
+        raise RuntimeError("No TensorBoard runs found in the specified directory.")
     if run_arg:
         indexes = parse_selection(run_arg, len(all_runs))
         return [all_runs[i] for i in indexes]
@@ -215,16 +216,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(str(exc), file=sys.stderr)
         return 1
 
-    while True:
-        try:
-            clear_terminal()
-            _render_once(selected_runs, metric, args.no_plot)
-        except RuntimeError as exc:
-            print(str(exc), file=sys.stderr)
-            return 1
-        if args.once:
-            return 0
-        time.sleep(max(0.1, args.refresh))
+    try:
+        while True:
+            try:
+                clear_terminal()
+                _render_once(selected_runs, metric, args.no_plot)
+            except RuntimeError as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+            if args.once:
+                return 0
+            time.sleep(max(0.1, args.refresh))
+    except KeyboardInterrupt:
+        return 0
 
 
 if __name__ == "__main__":
