@@ -109,29 +109,49 @@ def prompt_metric_selection(metrics: Sequence[str]) -> str:
 
 
 _SPARK_CHARS = "▁▂▃▄▅▆▇█"
+_MAX_SPARK_NAME = 35
 
 
-def render_sparklines(series: Dict[str, List[ScalarPoint]]) -> str:
+def _truncate_name(name: str) -> str:
+    if len(name) <= _MAX_SPARK_NAME:
+        return name
+    return name[: _MAX_SPARK_NAME - 1] + "…"
+
+
+def _downsample(values: List[float], n: int) -> List[float]:
+    if len(values) <= n:
+        return values
+    bucket_size = len(values) / n
+    result = []
+    for i in range(n):
+        start = int(i * bucket_size)
+        end = max(start + 1, int((i + 1) * bucket_size))
+        bucket = values[start:end]
+        result.append(sum(bucket) / len(bucket))
+    return result
+
+
+def render_sparklines(series: Dict[str, List[ScalarPoint]], width: int = 120) -> str:
     if not any(series.values()):
         return "No points to plot."
-    max_name_len = max(len(name) for name in series)
+    name_col = 2 + _MAX_SPARK_NAME  # 2-char indent + fixed name column
     lines = []
     for run_name, points in series.items():
+        display_name = _truncate_name(run_name)
         if not points:
-            lines.append(f"  {run_name:<{max_name_len}}  (no data)")
+            lines.append(f"  {display_name:<{_MAX_SPARK_NAME}}  (no data)")
             continue
         values = [p.value for p in points]
         lo, hi = min(values), max(values)
         span = hi - lo if hi != lo else 1.0
-        spark = "".join(
-            _SPARK_CHARS[min(7, int((v - lo) / span * 7.9999))] for v in values
-        )
         last = points[-1]
-        lines.append(
-            f"  {run_name:<{max_name_len}}  {spark}"
-            f"  step={last.step}  last={last.value:.4g}"
-            f"  min={lo:.4g}  max={hi:.4g}"
+        stats = f"  step={last.step}  last={last.value:.4g}  min={lo:.4g}  max={hi:.4g}"
+        spark_width = max(10, width - name_col - 2 - len(stats))
+        sampled = _downsample(values, spark_width)
+        spark = "".join(
+            _SPARK_CHARS[min(7, int((v - lo) / span * 7.9999))] for v in sampled
         )
+        lines.append(f"  {display_name:<{_MAX_SPARK_NAME}}  {spark}{stats}")
     return "\n".join(lines)
 
 
@@ -189,7 +209,7 @@ def render_plot(
     metric: str = "value",
 ) -> str:
     if style == "sparkline":
-        return render_sparklines(series)
+        return render_sparklines(series, width=width)
     if style == "plotext":
         return render_plot_plotext(series, metric=metric, width=width, height=height)
     if style == "ascii":

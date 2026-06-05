@@ -73,7 +73,7 @@ class TbCliTests(unittest.TestCase):
                 tbcli.ScalarPoint(step=2, value=0.18, wall_time=1),
             ],
         }
-        out = tbcli.render_sparklines(series)
+        out = tbcli.render_sparklines(series, width=120)
         self.assertIn("run1", out)
         self.assertIn("run2", out)
         self.assertEqual(len(out.splitlines()), 2)
@@ -101,6 +101,24 @@ class TbCliTests(unittest.TestCase):
 
     def test_render_sparklines_empty_series(self):
         self.assertEqual(tbcli.render_sparklines({"run1": []}), "No points to plot.")
+
+    def test_render_sparklines_truncates_long_name(self):
+        long_name = "a" * 50
+        series = {long_name: [tbcli.ScalarPoint(step=1, value=0.5, wall_time=0)]}
+        out = tbcli.render_sparklines(series, width=120)
+        self.assertIn("…", out)
+        self.assertEqual(len(out.splitlines()), 1)
+        self.assertNotIn(long_name, out)
+
+    def test_render_sparklines_downsamples(self):
+        series = {
+            "run1": [tbcli.ScalarPoint(step=i, value=float(i), wall_time=0) for i in range(200)]
+        }
+        out = tbcli.render_sparklines(series, width=80)
+        spark_chars = set(tbcli._SPARK_CHARS)
+        runs = "".join(c if c in spark_chars else " " for c in out).split()
+        longest_run = max((len(r) for r in runs), default=0)
+        self.assertLess(longest_run, 200)
 
     def test_render_sparklines_no_data_run(self):
         series = {
