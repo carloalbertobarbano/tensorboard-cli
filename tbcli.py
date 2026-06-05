@@ -108,33 +108,65 @@ def prompt_metric_selection(metrics: Sequence[str]) -> str:
             print("Invalid metric selection")
 
 
-def render_plot(series: Dict[str, List[ScalarPoint]], width: int = 60, height: int = 12) -> str:
-    values = []
-    for points in series.values():
-        values.extend(point.value for point in points)
-    if not values:
-        return "No points to plot."
+def _render_bar_chart(run_name: str, points: List[ScalarPoint], width: int = 60, height: int = 12) -> str:
+    """Render an ASCII bar chart for a single run with values on top of each bar."""
+    if not points:
+        return f"run: {run_name}\nNo points to plot."
+
+    values = [p.value for p in points]
     lo, hi = min(values), max(values)
     span = hi - lo if hi != lo else 1.0
-    canvas = [[" " for _ in range(width)] for _ in range(height)]
-    for run_index, (run_name, points) in enumerate(series.items()):
-        marker = str((run_index + 1) % 10)
-        if not points:
-            continue
-        xs = [point.step for point in points]
-        min_x, max_x = min(xs), max(xs)
-        x_span = max_x - min_x if max_x != min_x else 1
-        for point in points:
-            x = int((point.step - min_x) / x_span * (width - 1))
-            y = int((point.value - lo) / span * (height - 1))
-            y = (height - 1) - y
-            canvas[y][x] = marker
-    lines = [f"value range [{lo:.4g}, {hi:.4g}]"]
+
+    n = len(points)
+    bar_width = max(1, width // n)
+    canvas_width = n * bar_width
+    inner_width = bar_width - 1 if bar_width > 1 else 1
+
+    canvas = [[" "] * canvas_width for _ in range(height)]
+
+    for i, point in enumerate(points):
+        bar_height = height - 1 if hi == lo else int((point.value - lo) / span * (height - 1))
+        x_start = i * bar_width
+        for row in range(bar_height + 1):
+            y = (height - 1) - row
+            for col in range(inner_width):
+                x = x_start + col
+                if x < canvas_width:
+                    canvas[y][x] = "\u2588"
+
+    label_chars = [" "] * canvas_width
+    for i, point in enumerate(points):
+        label = f"{point.value:.4g}"
+        x_pos = i * bar_width
+        if bar_width >= len(label):
+            for j, ch in enumerate(label):
+                if x_pos + j < canvas_width:
+                    label_chars[x_pos + j] = ch
+
+    step_chars = [" "] * canvas_width
+    for i, point in enumerate(points):
+        step_str = str(point.step)
+        x_pos = i * bar_width
+        if bar_width >= len(step_str):
+            for j, ch in enumerate(step_str):
+                if x_pos + j < canvas_width:
+                    step_chars[x_pos + j] = ch
+
+    lines = [
+        f"run: {run_name}",
+        f"value range [{lo:.4g}, {hi:.4g}]",
+        "".join(label_chars),
+    ]
     lines.extend("".join(row) for row in canvas)
-    lines.append("legend:")
-    for idx, run_name in enumerate(series.keys(), start=1):
-        lines.append(f"  {idx % 10}: {run_name}")
+    lines.append("step: " + "".join(step_chars))
     return "\n".join(lines)
+
+
+def render_plot(series: Dict[str, List[ScalarPoint]], width: int = 60, height: int = 12) -> str:
+    if not any(series.values()):
+        return "No points to plot."
+    parts = [_render_bar_chart(run_name, points, width, height) for run_name, points in series.items()]
+    return "\n\n".join(parts)
 
 
 def clear_terminal() -> None:

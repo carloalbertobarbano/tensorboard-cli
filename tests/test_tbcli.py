@@ -60,7 +60,7 @@ class TbCliTests(unittest.TestCase):
         self.assertIn("loss", loaded["/logs/r1"])
         self.assertEqual(loaded["/logs/r1"]["loss"][-1].value, 0.25)
 
-    def test_render_plot_has_legend(self):
+    def test_render_plot_separate_charts(self):
         series = {
             "run1": [
                 tbcli.ScalarPoint(step=1, value=0.1, wall_time=0),
@@ -71,10 +71,12 @@ class TbCliTests(unittest.TestCase):
                 tbcli.ScalarPoint(step=2, value=0.18, wall_time=1),
             ],
         }
-        plot = tbcli.render_plot(series, width=10, height=4)
-        self.assertIn("legend:", plot)
-        self.assertIn("run1", plot)
-        self.assertIn("run2", plot)
+        plot = tbcli.render_plot(series, width=20, height=4)
+        self.assertIn("run: run1", plot)
+        self.assertIn("run: run2", plot)
+        # each run's value should appear as a label above its bar
+        self.assertIn("0.1", plot)
+        self.assertIn("0.2", plot)
 
     def test_render_plot_empty_series(self):
         self.assertEqual(tbcli.render_plot({"run1": []}), "No points to plot.")
@@ -86,8 +88,9 @@ class TbCliTests(unittest.TestCase):
                 tbcli.ScalarPoint(step=2, value=0.3, wall_time=1),
             ]
         }
-        plot = tbcli.render_plot(series, width=10, height=4)
+        plot = tbcli.render_plot(series, width=20, height=4)
         self.assertIn("value range [0.3, 0.3]", plot)
+        self.assertIn("run: run1", plot)
 
 
 if __name__ == "__main__":
