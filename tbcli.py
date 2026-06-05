@@ -155,7 +155,8 @@ def render_plot_plotext(
     for run_name, points in series.items():
         if not points:
             continue
-        plt.plot([p.step for p in points], [p.value for p in points], label=run_name)
+        last_val = points[-1].value
+        plt.plot([p.step for p in points], [p.value for p in points], label=f"{run_name}  {last_val:.6g}")
     return plt.build()
 
 
@@ -259,12 +260,6 @@ def _render_once(
     loaded = load_scalars(selected_runs)
     data = _summaries_for_metric(loaded, metric)
     print(f"metric: {metric}")
-    for run_name, points in data.items():
-        if points:
-            last = points[-1]
-            print(f"  {run_name}: step={last.step} value={last.value:.6g}")
-        else:
-            print(f"  {run_name}: no data")
     if not no_plot:
         try:
             cols, rows = os.get_terminal_size()
