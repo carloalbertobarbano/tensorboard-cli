@@ -60,6 +60,13 @@ class InteractiveState:
     cursor_idx: int = 0
     highlighted_runs: Set[str] = field(default_factory=set)
 
+    def copy(self) -> "InteractiveState":
+        return InteractiveState(
+            legend_position=self.legend_position,
+            cursor_idx=self.cursor_idx,
+            highlighted_runs=set(self.highlighted_runs),
+        )
+
 
 def discover_runs(logdir: Path) -> List[Path]:
     runs = []
@@ -445,57 +452,63 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     use_interactive = _HAS_TTY and sys.stdin.isatty() and not args.once
 
     if use_interactive:
-        state = InteractiveState()
+        state        = InteractiveState()
+        data_lock    = threading.Lock()
+        state_lock   = threading.Lock()
+        render_event = threading.Event()
+        stop_event   = threading.Event()
 
-        lock    = threading.Lock()
-        updated = threading.Event()
-        stop    = threading.Event()
-        latest: Dict[str, Dict[str, List[ScalarPoint]]] = {}
+        with data_lock:
+            latest = loaded  # seed with data already loaded above
 
         def _bg_load() -> None:
             nonlocal latest
-            while not stop.is_set():
+            stop_event.wait(args.refresh)  # first load already done by main thread
+            while not stop_event.is_set():
                 new_data = load_scalars(selected_runs)
-                with lock:
+                with data_lock:
                     latest = new_data
-                updated.set()
-                stop.wait(args.refresh)
+                render_event.set()
+                stop_event.wait(args.refresh)
 
-        bg = threading.Thread(target=_bg_load, daemon=True)
-        bg.start()
-        updated.wait()
-        updated.clear()
+        def _render_loop() -> None:
+            while not stop_event.is_set():
+                if not render_event.wait(timeout=0.05):
+                    continue
+                render_event.clear()  # clear before render so mid-render triggers survive
+                with data_lock:
+                    snapshot = latest
+                with state_lock:
+                    state_snap = state.copy()
+                clear_terminal()
+                try:
+                    _render_from_loaded(
+                        snapshot, metric, args.no_plot, args.plot_style, state=state_snap
+                    )
+                except RuntimeError as exc:
+                    print(str(exc), file=sys.stderr)
+
+        threading.Thread(target=_bg_load,     daemon=True).start()
+        threading.Thread(target=_render_loop,  daemon=True).start()
+        render_event.set()  # trigger first paint immediately
 
         fd = sys.stdin.fileno()
         old_settings = _termios.tcgetattr(fd)
-        needs_render = True
         try:
             _tty.setcbreak(fd)
-            while True:
-                if updated.is_set():
-                    updated.clear()
-                    needs_render = True
-
-                if needs_render:
-                    with lock:
-                        snapshot = latest
-                    clear_terminal()
-                    try:
-                        _render_from_loaded(snapshot, metric, args.no_plot, args.plot_style, state=state)
-                    except RuntimeError as exc:
-                        print(str(exc), file=sys.stderr)
-                        return 1
-                    needs_render = False
-
+            while True:  # keyboard only — never touches stdout
                 rlist, _, _ = _select.select([sys.stdin], [], [], 0.05)
                 if rlist:
                     key = _read_key_nonblocking()
-                    if key and _handle_key(key, state, run_names):
-                        needs_render = True
+                    if key:
+                        with state_lock:
+                            changed = _handle_key(key, state, run_names)
+                        if changed:
+                            render_event.set()
         except KeyboardInterrupt:
-            return 0
+            pass
         finally:
-            stop.set()
+            stop_event.set()
             _termios.tcsetattr(fd, _termios.TCSADRAIN, old_settings)
     else:
         try:
