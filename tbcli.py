@@ -38,8 +38,8 @@ def _ansi_fg(r: int, g: int, b: int) -> str:
     return f"\033[38;2;{r};{g};{b}m"
 
 
-def _dim_color(r: int, g: int, b: int, factor: float = 0.35) -> Tuple[int, int, int]:
-    bg = 15
+def _dim_color(r: int, g: int, b: int, dark_mode: bool = False, factor: float = 0.35) -> Tuple[int, int, int]:
+    bg = 10 if dark_mode else 230
     return (
         int(bg + (r - bg) * factor),
         int(bg + (g - bg) * factor),
@@ -59,12 +59,14 @@ class InteractiveState:
     legend_position: str = "top"
     cursor_idx: int = 0
     highlighted_runs: Set[str] = field(default_factory=set)
+    dark_mode: bool = False
 
     def copy(self) -> "InteractiveState":
         return InteractiveState(
             legend_position=self.legend_position,
             cursor_idx=self.cursor_idx,
             highlighted_runs=set(self.highlighted_runs),
+            dark_mode=self.dark_mode,
         )
 
 
@@ -201,8 +203,8 @@ def _render_legend(
         if is_highlighted:
             fmt = _ANSI_BOLD + _ansi_fg(r, g, b)
         elif has_highlight:
-            dr, dg, db = _dim_color(r, g, b)
-            fmt = _ANSI_DIM + _ansi_fg(dr, dg, db)
+            dr, dg, db = _dim_color(r, g, b, dark_mode=state.dark_mode)
+            fmt = (_ANSI_DIM if state.dark_mode else "") + _ansi_fg(dr, dg, db)
         else:
             fmt = _ansi_fg(r, g, b)
 
@@ -230,6 +232,10 @@ def render_plot_plotext(
     plt.title(metric)
     plt.xlabel("step")
     plt.ylabel("value")
+    if state is not None and state.dark_mode:
+        plt.canvas_color("black")
+        plt.axes_color("black")
+        plt.ticks_color("white")
 
     has_highlight = state is not None and bool(state.highlighted_runs)
     run_names = list(series.keys())
@@ -243,7 +249,7 @@ def render_plot_plotext(
         r, g, b = _PALETTE_RGB[i % len(_PALETTE_RGB)]
 
         if has_highlight and run_name not in state.highlighted_runs:  # type: ignore[union-attr]
-            color: Tuple[int, int, int] = _dim_color(r, g, b)
+            color: Tuple[int, int, int] = _dim_color(r, g, b, dark_mode=state.dark_mode)  # type: ignore[union-attr]
         else:
             color = (r, g, b)
 
@@ -347,6 +353,9 @@ def _handle_key(key: str, state: InteractiveState, run_names: List[str]) -> bool
     elif key == " " and run_names:
         run = run_names[state.cursor_idx]
         state.highlighted_runs ^= {run}
+        return True
+    elif key == "d":
+        state.dark_mode = not state.dark_mode
         return True
     return False
 
