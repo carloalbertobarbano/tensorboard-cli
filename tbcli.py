@@ -108,33 +108,93 @@ def prompt_metric_selection(metrics: Sequence[str]) -> str:
             print("Invalid metric selection")
 
 
-def render_plot(series: Dict[str, List[ScalarPoint]], width: int = 60, height: int = 12) -> str:
-    values = []
-    for points in series.values():
-        values.extend(point.value for point in points)
-    if not values:
+_SPARK_CHARS = "▁▂▃▄▅▆▇█"
+
+
+def render_sparklines(series: Dict[str, List[ScalarPoint]]) -> str:
+    if not any(series.values()):
         return "No points to plot."
-    lo, hi = min(values), max(values)
-    span = hi - lo if hi != lo else 1.0
-    canvas = [[" " for _ in range(width)] for _ in range(height)]
-    for run_index, (run_name, points) in enumerate(series.items()):
-        marker = str((run_index + 1) % 10)
+    max_name_len = max(len(name) for name in series)
+    lines = []
+    for run_name, points in series.items():
+        if not points:
+            lines.append(f"  {run_name:<{max_name_len}}  (no data)")
+            continue
+        values = [p.value for p in points]
+        lo, hi = min(values), max(values)
+        span = hi - lo if hi != lo else 1.0
+        spark = "".join(
+            _SPARK_CHARS[min(7, int((v - lo) / span * 7.9999))] for v in values
+        )
+        last = points[-1]
+        lines.append(
+            f"  {run_name:<{max_name_len}}  {spark}"
+            f"  step={last.step}  last={last.value:.4g}"
+            f"  min={lo:.4g}  max={hi:.4g}"
+        )
+    return "\n".join(lines)
+
+
+def render_plot_plotext(
+    series: Dict[str, List[ScalarPoint]],
+    metric: str = "value",
+    width: int = 80,
+    height: int = 24,
+) -> str:
+    try:
+        import plotext as plt  # type: ignore
+    except ImportError:
+        return "plotext not installed. Run: pip install 'plotext>=5.0'"
+    if not any(series.values()):
+        return "No points to plot."
+    plt.clf()
+    plt.plot_size(width, height)
+    plt.title(metric)
+    plt.xlabel("step")
+    plt.ylabel("value")
+    for run_name, points in series.items():
         if not points:
             continue
-        xs = [point.step for point in points]
-        min_x, max_x = min(xs), max(xs)
-        x_span = max_x - min_x if max_x != min_x else 1
-        for point in points:
-            x = int((point.step - min_x) / x_span * (width - 1))
-            y = int((point.value - lo) / span * (height - 1))
-            y = (height - 1) - y
-            canvas[y][x] = marker
-    lines = [f"value range [{lo:.4g}, {hi:.4g}]"]
-    lines.extend("".join(row) for row in canvas)
-    lines.append("legend:")
-    for idx, run_name in enumerate(series.keys(), start=1):
-        lines.append(f"  {idx % 10}: {run_name}")
-    return "\n".join(lines)
+        plt.plot([p.step for p in points], [p.value for p in points], label=run_name)
+    return plt.build()
+
+
+def render_plot_ascii(series: Dict[str, List[ScalarPoint]], height: int = 12) -> str:
+    try:
+        import asciichartpy  # type: ignore
+    except ImportError:
+        return "asciichartpy not installed. Run: pip install asciichartpy"
+    if not any(series.values()):
+        return "No points to plot."
+    parts = []
+    for run_name, points in series.items():
+        if not points:
+            parts.append(f"run: {run_name}\n  (no data)")
+            continue
+        values = [p.value for p in points]
+        steps = [p.step for p in points]
+        chart = asciichartpy.plot(values, cfg={"height": height})
+        parts.append(
+            f"run: {run_name}\n{chart}\n"
+            f"  steps {steps[0]}..{steps[-1]}"
+        )
+    return "\n\n".join(parts)
+
+
+def render_plot(
+    series: Dict[str, List[ScalarPoint]],
+    width: int = 80,
+    height: int = 24,
+    style: str = "plotext",
+    metric: str = "value",
+) -> str:
+    if style == "sparkline":
+        return render_sparklines(series)
+    if style == "plotext":
+        return render_plot_plotext(series, metric=metric, width=width, height=height)
+    if style == "ascii":
+        return render_plot_ascii(series, height=max(4, height // 2))
+    raise ValueError(f"Unknown plot style: {style!r}. Choose 'plotext', 'sparkline', or 'ascii'.")
 
 
 def clear_terminal() -> None:
@@ -148,7 +208,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--metric", help="Metric tag to preselect")
     parser.add_argument("--refresh", type=float, default=5.0, help="Auto-refresh interval seconds")
     parser.add_argument("--once", action="store_true", help="Render once and exit")
-    parser.add_argument("--no-plot", action="store_true", help="Disable ASCII plotting")
+    parser.add_argument("--no-plot", action="store_true", help="Disable plotting")
+    parser.add_argument(
+        "--plot-style",
+        choices=["plotext", "sparkline", "ascii"],
+        default="plotext",
+        help="Plot style: 'plotext' (line chart, default), 'sparkline' (compact block chars), or 'ascii' (asciichartpy per-run charts)",
+    )
     return parser.parse_args(argv)
 
 
@@ -184,7 +250,12 @@ def _summaries_for_metric(
     return data
 
 
-def _render_once(selected_runs: Sequence[Path], metric: str, no_plot: bool) -> None:
+def _render_once(
+    selected_runs: Sequence[Path],
+    metric: str,
+    no_plot: bool,
+    plot_style: str = "plotext",
+) -> None:
     loaded = load_scalars(selected_runs)
     data = _summaries_for_metric(loaded, metric)
     print(f"metric: {metric}")
@@ -195,8 +266,12 @@ def _render_once(selected_runs: Sequence[Path], metric: str, no_plot: bool) -> N
         else:
             print(f"  {run_name}: no data")
     if not no_plot:
+        try:
+            cols, rows = os.get_terminal_size()
+        except OSError:
+            cols, rows = 80, 24
         print()
-        print(render_plot(data))
+        print(render_plot(data, width=cols, height=rows - 10, style=plot_style, metric=metric))
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -220,7 +295,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         while True:
             try:
                 clear_terminal()
-                _render_once(selected_runs, metric, args.no_plot)
+                _render_once(selected_runs, metric, args.no_plot, args.plot_style)
             except RuntimeError as exc:
                 print(str(exc), file=sys.stderr)
                 return 1

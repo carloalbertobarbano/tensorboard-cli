@@ -1,1 +1,3 @@
 tensorboard>=2.0
+plotext>=5.0
+asciichartpy
