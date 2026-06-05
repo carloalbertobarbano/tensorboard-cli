@@ -2,6 +2,7 @@
 import argparse
 import os
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -392,14 +393,13 @@ def _summaries_for_metric(
     return data
 
 
-def _render_once(
-    selected_runs: Sequence[Path],
+def _render_from_loaded(
+    loaded: Dict[str, Dict[str, List[ScalarPoint]]],
     metric: str,
     no_plot: bool,
     plot_style: str = "plotext",
     state: Optional[InteractiveState] = None,
 ) -> None:
-    loaded = load_scalars(selected_runs)
     data = _summaries_for_metric(loaded, metric)
     print(f"metric: {metric}")
     if state is not None:
@@ -411,6 +411,17 @@ def _render_once(
             cols, rows = 80, 24
         print()
         print(render_plot(data, width=cols, height=rows - 10, style=plot_style, metric=metric, state=state))
+
+
+def _render_once(
+    selected_runs: Sequence[Path],
+    metric: str,
+    no_plot: bool,
+    plot_style: str = "plotext",
+    state: Optional[InteractiveState] = None,
+) -> None:
+    loaded = load_scalars(selected_runs)
+    _render_from_loaded(loaded, metric, no_plot, plot_style, state=state)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -435,31 +446,56 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if use_interactive:
         state = InteractiveState()
+
+        lock    = threading.Lock()
+        updated = threading.Event()
+        stop    = threading.Event()
+        latest: Dict[str, Dict[str, List[ScalarPoint]]] = {}
+
+        def _bg_load() -> None:
+            nonlocal latest
+            while not stop.is_set():
+                new_data = load_scalars(selected_runs)
+                with lock:
+                    latest = new_data
+                updated.set()
+                stop.wait(args.refresh)
+
+        bg = threading.Thread(target=_bg_load, daemon=True)
+        bg.start()
+        updated.wait()
+        updated.clear()
+
         fd = sys.stdin.fileno()
         old_settings = _termios.tcgetattr(fd)
+        needs_render = True
         try:
             _tty.setcbreak(fd)
-            last_render: float = -1.0
             while True:
-                now = time.monotonic()
-                if now - last_render >= args.refresh:
+                if updated.is_set():
+                    updated.clear()
+                    needs_render = True
+
+                if needs_render:
+                    with lock:
+                        snapshot = latest
                     clear_terminal()
                     try:
-                        _render_once(selected_runs, metric, args.no_plot, args.plot_style, state=state)
+                        _render_from_loaded(snapshot, metric, args.no_plot, args.plot_style, state=state)
                     except RuntimeError as exc:
                         print(str(exc), file=sys.stderr)
                         return 1
-                    last_render = time.monotonic()
+                    needs_render = False
 
-                timeout = max(0.05, last_render + args.refresh - time.monotonic())
-                rlist, _, _ = _select.select([sys.stdin], [], [], timeout)
+                rlist, _, _ = _select.select([sys.stdin], [], [], 0.05)
                 if rlist:
                     key = _read_key_nonblocking()
                     if key and _handle_key(key, state, run_names):
-                        last_render = -1.0  # force immediate re-render
+                        needs_render = True
         except KeyboardInterrupt:
             return 0
         finally:
+            stop.set()
             _termios.tcsetattr(fd, _termios.TCSADRAIN, old_settings)
     else:
         try:
