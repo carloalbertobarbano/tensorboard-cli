@@ -155,6 +155,41 @@ class TbCliTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             tbcli.render_plot(series, style="bogus")
 
+    # --- asciichartpy tests ---
+
+    def test_render_plot_ascii_returns_string(self):
+        series = {
+            "run1": [
+                tbcli.ScalarPoint(step=i, value=float(i) * 0.1, wall_time=0)
+                for i in range(1, 6)
+            ]
+        }
+        out = tbcli.render_plot_ascii(series, height=6)
+        self.assertIsInstance(out, str)
+        self.assertIn("run1", out)
+        self.assertTrue(len(out) > 0)
+
+    def test_render_plot_ascii_empty_series(self):
+        self.assertEqual(tbcli.render_plot_ascii({"run1": []}), "No points to plot.")
+
+    def test_render_plot_ascii_shows_step_range(self):
+        series = {
+            "run1": [
+                tbcli.ScalarPoint(step=10, value=0.5, wall_time=0),
+                tbcli.ScalarPoint(step=20, value=0.8, wall_time=1),
+            ]
+        }
+        out = tbcli.render_plot_ascii(series, height=4)
+        self.assertIn("10", out)
+        self.assertIn("20", out)
+
+    def test_render_plot_dispatches_ascii(self):
+        series = {
+            "run1": [tbcli.ScalarPoint(step=i, value=float(i), wall_time=0) for i in range(1, 5)]
+        }
+        out = tbcli.render_plot(series, style="ascii", height=8)
+        self.assertIn("run1", out)
+
 
 if __name__ == "__main__":
     unittest.main()

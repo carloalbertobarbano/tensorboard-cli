@@ -159,6 +159,28 @@ def render_plot_plotext(
     return plt.build()
 
 
+def render_plot_ascii(series: Dict[str, List[ScalarPoint]], height: int = 12) -> str:
+    try:
+        import asciichartpy  # type: ignore
+    except ImportError:
+        return "asciichartpy not installed. Run: pip install asciichartpy"
+    if not any(series.values()):
+        return "No points to plot."
+    parts = []
+    for run_name, points in series.items():
+        if not points:
+            parts.append(f"run: {run_name}\n  (no data)")
+            continue
+        values = [p.value for p in points]
+        steps = [p.step for p in points]
+        chart = asciichartpy.plot(values, cfg={"height": height})
+        parts.append(
+            f"run: {run_name}\n{chart}\n"
+            f"  steps {steps[0]}..{steps[-1]}"
+        )
+    return "\n\n".join(parts)
+
+
 def render_plot(
     series: Dict[str, List[ScalarPoint]],
     width: int = 80,
@@ -170,7 +192,9 @@ def render_plot(
         return render_sparklines(series)
     if style == "plotext":
         return render_plot_plotext(series, metric=metric, width=width, height=height)
-    raise ValueError(f"Unknown plot style: {style!r}. Choose 'plotext' or 'sparkline'.")
+    if style == "ascii":
+        return render_plot_ascii(series, height=max(4, height // 2))
+    raise ValueError(f"Unknown plot style: {style!r}. Choose 'plotext', 'sparkline', or 'ascii'.")
 
 
 def clear_terminal() -> None:
@@ -187,9 +211,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--no-plot", action="store_true", help="Disable plotting")
     parser.add_argument(
         "--plot-style",
-        choices=["plotext", "sparkline"],
+        choices=["plotext", "sparkline", "ascii"],
         default="plotext",
-        help="Plot style: 'plotext' (line chart, default) or 'sparkline' (compact block chars)",
+        help="Plot style: 'plotext' (line chart, default), 'sparkline' (compact block chars), or 'ascii' (asciichartpy per-run charts)",
     )
     return parser.parse_args(argv)
 
