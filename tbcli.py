@@ -211,6 +211,49 @@ def _render_legend(
     return "\n".join(lines)
 
 
+def _build_plotext_plot(
+    series: Dict[str, List[ScalarPoint]],
+    metric: str,
+    width: int,
+    height: int,
+    highlighted_runs: Set[str],
+) -> Tuple[str, Dict[str, float], List[str]]:
+    """Build just the plotext plot string (no legend). Returns (plot_str, last_values, run_names)."""
+    try:
+        import plotext as plt  # type: ignore
+    except ImportError:
+        return "plotext not installed. Run: pip install 'plotext>=5.0'", {}, []
+
+    if not any(series.values()):
+        return "No points to plot.", {}, list(series.keys())
+
+    plt.clf()
+    plt.plot_size(width, height)
+    plt.title(metric)
+    plt.xlabel("step")
+    plt.ylabel("value")
+
+    has_highlight = bool(highlighted_runs)
+    run_names = list(series.keys())
+    last_values: Dict[str, float] = {}
+
+    for i, (run_name, points) in enumerate(series.items()):
+        if not points:
+            continue
+        last_val = points[-1].value
+        last_values[run_name] = last_val
+        r, g, b = _PALETTE_RGB[i % len(_PALETTE_RGB)]
+
+        if has_highlight and run_name not in highlighted_runs:
+            color: Tuple[int, int, int] = _dim_color(r, g, b)
+        else:
+            color = (r, g, b)
+
+        plt.plot([p.step for p in points], [p.value for p in points], color=color)
+
+    return plt.build(), last_values, run_names
+
+
 def render_plot_plotext(
     series: Dict[str, List[ScalarPoint]],
     metric: str = "value",
@@ -225,47 +268,34 @@ def render_plot_plotext(
     if not any(series.values()):
         return "No points to plot."
 
+    if state is not None:
+        plot_str, last_values, run_names = _build_plotext_plot(
+            series, metric, width, height, state.highlighted_runs
+        )
+        legend_str = _render_legend(run_names, last_values, state)
+        if state.legend_position == "bottom":
+            return plot_str + "\n" + legend_str
+        return legend_str + "\n" + plot_str
+
     plt.clf()
     plt.plot_size(width, height)
     plt.title(metric)
     plt.xlabel("step")
     plt.ylabel("value")
 
-    has_highlight = state is not None and bool(state.highlighted_runs)
-    run_names = list(series.keys())
-    last_values: Dict[str, float] = {}
-
     for i, (run_name, points) in enumerate(series.items()):
         if not points:
             continue
         last_val = points[-1].value
-        last_values[run_name] = last_val
         r, g, b = _PALETTE_RGB[i % len(_PALETTE_RGB)]
+        plt.plot(
+            [p.step for p in points],
+            [p.value for p in points],
+            label=f"{run_name}  {last_val:.6g}",
+            color=(r, g, b),
+        )
 
-        if has_highlight and run_name not in state.highlighted_runs:  # type: ignore[union-attr]
-            color: Tuple[int, int, int] = _dim_color(r, g, b)
-        else:
-            color = (r, g, b)
-
-        if state is not None:
-            plt.plot([p.step for p in points], [p.value for p in points], color=color)
-        else:
-            plt.plot(
-                [p.step for p in points],
-                [p.value for p in points],
-                label=f"{run_name}  {last_val:.6g}",
-                color=color,
-            )
-
-    plot_str = plt.build()
-
-    if state is None:
-        return plot_str
-
-    legend_str = _render_legend(run_names, last_values, state)
-    if state.legend_position == "bottom":
-        return plot_str + "\n" + legend_str
-    return legend_str + "\n" + plot_str
+    return plt.build()
 
 
 def render_plot_ascii(series: Dict[str, List[ScalarPoint]], height: int = 12) -> str:
@@ -472,6 +502,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 stop_event.wait(args.refresh)
 
         def _render_loop() -> None:
+            _plot_cache_key: Optional[Tuple] = None
+            _cached_plot_str: str = ""
+            _cached_last_values: Dict[str, float] = {}
+            _cached_run_names: List[str] = []
+
             while not stop_event.is_set():
                 if not render_event.wait(timeout=0.05):
                     continue
@@ -480,7 +515,35 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     snapshot = latest
                 with state_lock:
                     state_snap = state.copy()
+
                 clear_terminal()
+
+                # Fast path for plotext interactive: cache the slow plt.build() call and
+                # only redo it when data or highlight state changes. Cursor movement only
+                # needs a legend redraw, which is near-instantaneous.
+                if not args.no_plot and args.plot_style == "plotext":
+                    try:
+                        cols, rows = os.get_terminal_size()
+                    except OSError:
+                        cols, rows = 80, 24
+                    plot_h = max(4, rows - 10)
+                    data = _summaries_for_metric(snapshot, metric)
+                    cache_key = (id(snapshot), frozenset(state_snap.highlighted_runs), cols, plot_h)
+                    if cache_key != _plot_cache_key:
+                        _plot_cache_key = cache_key
+                        _cached_plot_str, _cached_last_values, _cached_run_names = (
+                            _build_plotext_plot(data, metric, cols, plot_h, state_snap.highlighted_runs)
+                        )
+                    legend_str = _render_legend(_cached_run_names, _cached_last_values, state_snap)
+                    print(f"metric: {metric}")
+                    print("  t=top  b=bottom  ↑/↓=navigate  space=highlight  ctrl+c=quit")
+                    print()
+                    if state_snap.legend_position == "bottom":
+                        print(_cached_plot_str + "\n" + legend_str)
+                    else:
+                        print(legend_str + "\n" + _cached_plot_str)
+                    continue
+
                 try:
                     _render_from_loaded(
                         snapshot, metric, args.no_plot, args.plot_style, state=state_snap
