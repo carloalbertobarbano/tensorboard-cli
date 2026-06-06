@@ -1,3 +1,6 @@
+import io
+import struct
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -359,6 +362,132 @@ class TbCliTests(unittest.TestCase):
         self.assertIsInstance(out, str)
         self.assertIn("run1", out)
         self.assertIn("run2", out)
+
+
+def _write_fake_tfrecord(fh: io.RawIOBase, data: bytes) -> None:
+    """Write a TF record with zero CRCs (sufficient for readers that skip CRC validation)."""
+    fh.write(struct.pack("<Q", len(data)))  # uint64 length
+    fh.write(struct.pack("<I", 0))          # masked CRC of length (fake)
+    fh.write(data)                          # payload
+    fh.write(struct.pack("<I", 0))          # masked CRC of payload (fake)
+
+
+def _make_scalar_event(step: int, tag: str, value: float, wall_time: float = 1.0) -> bytes:
+    """Return serialized Event proto with one scalar summary value."""
+    from tensorboard.compat.proto.event_pb2 import Event
+    ev = Event()
+    ev.wall_time = wall_time
+    ev.step = step
+    sv = ev.summary.value.add()
+    sv.tag = tag
+    sv.simple_value = value
+    return ev.SerializeToString()
+
+
+def _write_fake_events_file(path: str, steps_and_tags: list) -> None:
+    """Write a minimal TF events file.
+
+    steps_and_tags: list of (step, tag, value) triples.
+    """
+    with open(path, "wb") as fh:
+        for step, tag, value in steps_and_tags:
+            _write_fake_tfrecord(fh, _make_scalar_event(step, tag, value))
+
+
+class FastLoadTests(unittest.TestCase):
+    # --- _parse_event_step ---
+
+    def test_parse_event_step_normal_event(self):
+        from tensorboard.compat.proto.event_pb2 import Event
+        ev = Event()
+        ev.wall_time = 1.0
+        ev.step = 12345
+        sv = ev.summary.value.add()
+        sv.tag = "train/loss"
+        sv.simple_value = 0.5
+        self.assertEqual(tbcli._parse_event_step(ev.SerializeToString()), 12345)
+
+    def test_parse_event_step_large_step(self):
+        from tensorboard.compat.proto.event_pb2 import Event
+        ev = Event()
+        ev.wall_time = 1.0
+        ev.step = 100_000
+        self.assertEqual(tbcli._parse_event_step(ev.SerializeToString()), 100_000)
+
+    def test_parse_event_step_no_step_field(self):
+        # wall_time=1.0 but no explicit step → step field omitted (proto3 default=0)
+        from tensorboard.compat.proto.event_pb2 import Event
+        ev = Event()
+        ev.wall_time = 1.0
+        # step not set → proto3 omits it from serialized bytes
+        self.assertEqual(tbcli._parse_event_step(ev.SerializeToString()), 0)
+
+    def test_parse_event_step_empty_bytes(self):
+        self.assertIsNone(tbcli._parse_event_step(b""))
+
+    def test_parse_event_step_invalid_bytes(self):
+        self.assertIsNone(tbcli._parse_event_step(b"\x00" * 20))
+
+    # --- load_scalars_fast end-to-end ---
+
+    def _make_run_dir(self, steps_and_tags):
+        """Create a temporary run directory with a fake events file."""
+        td = tempfile.mkdtemp()
+        events_path = Path(td) / "events.out.tfevents.0000.host.0.0"
+        _write_fake_events_file(str(events_path), steps_and_tags)
+        return Path(td)
+
+    def test_load_scalars_fast_all_tags_present(self):
+        # 3 steps × 2 tags, stride=1 → all points returned
+        run = self._make_run_dir([
+            (10, "loss", 1.0), (10, "lr", 0.1),
+            (20, "loss", 0.8), (20, "lr", 0.09),
+            (30, "loss", 0.6), (30, "lr", 0.08),
+        ])
+        data = tbcli.load_scalars_fast([run], stride=1, tail=0)
+        self.assertIn("loss", data[str(run)])
+        self.assertIn("lr", data[str(run)])
+        self.assertEqual(len(data[str(run)]["loss"]), 3)
+        self.assertEqual(len(data[str(run)]["lr"]), 3)
+
+    def test_load_scalars_fast_stride_keeps_every_nth_step(self):
+        # 10 steps, stride=2 → every other step (indices 0, 2, 4, 6, 8)
+        steps_tags = [(s * 10, "loss", float(s)) for s in range(1, 11)]
+        run = self._make_run_dir(steps_tags)
+        data = tbcli.load_scalars_fast([run], stride=2, tail=0)
+        pts = data[str(run)]["loss"]
+        # stride=2 keeps step_index=0,2,4,6,8 → 5 points
+        self.assertEqual(len(pts), 5)
+
+    def test_load_scalars_fast_tail_always_kept(self):
+        # 10 steps, stride=10 keeps only step_index=0, but tail=3 keeps last 3
+        steps_tags = [(s * 10, "loss", float(s)) for s in range(1, 11)]
+        run = self._make_run_dir(steps_tags)
+        data = tbcli.load_scalars_fast([run], stride=10, tail=3)
+        pts = data[str(run)]["loss"]
+        last_step = pts[-1].step
+        self.assertEqual(last_step, 100)  # tail contains the last step
+
+    def test_load_scalars_fast_all_tags_for_kept_steps(self):
+        # 5 steps × 2 tags; stride=2 should keep same steps for both tags
+        steps_tags = []
+        for s in range(1, 6):
+            steps_tags.append((s * 5, "loss", float(s)))
+            steps_tags.append((s * 5, "acc", float(s) * 0.1))
+        run = self._make_run_dir(steps_tags)
+        data = tbcli.load_scalars_fast([run], stride=2, tail=0)
+        loss_steps = {p.step for p in data[str(run)]["loss"]}
+        acc_steps  = {p.step for p in data[str(run)]["acc"]}
+        # Both metrics should cover the same steps
+        self.assertEqual(loss_steps, acc_steps)
+
+    def test_load_scalars_fast_empty_run(self):
+        td = tempfile.mkdtemp()
+        events_path = Path(td) / "events.out.tfevents.0000.host.0.0"
+        with open(str(events_path), "wb"):
+            pass  # empty file
+        data = tbcli.load_scalars_fast([Path(td)], stride=10, tail=500)
+        self.assertEqual(data[str(Path(td))], {})
 
 
 if __name__ == "__main__":

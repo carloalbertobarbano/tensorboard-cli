@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 import argparse
 import os
+import struct
 import sys
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 EVENT_FILE_PREFIX = "events.out.tfevents."
 
@@ -114,6 +115,174 @@ def load_scalars(
                 for event in acc.Scalars(tag)
             ]
             loaded[str(run)][tag] = points
+    return loaded
+
+
+_TF_RECORD_HEADER_BYTES = 12  # uint64 data_length + uint32 masked CRC of length
+_TF_RECORD_FOOTER_BYTES = 4   # uint32 masked CRC of data
+
+
+def _count_tfrecord_events(path: str) -> int:
+    """Count TF records using header seeks only — no protobuf parsing."""
+    count = 0
+    with open(path, "rb") as fh:
+        while True:
+            header = fh.read(_TF_RECORD_HEADER_BYTES)
+            if len(header) < _TF_RECORD_HEADER_BYTES:
+                break
+            (data_len,) = struct.unpack("<Q", header[:8])
+            fh.seek(data_len + _TF_RECORD_FOOTER_BYTES, 1)
+            count += 1
+    return count
+
+
+def _scan_step_info(path: str) -> Tuple[int, int, int]:
+    """Parse the first two logged steps to estimate file characteristics.
+
+    Returns (records_per_step, first_step, step_interval) where records_per_step
+    is the number of scalar records per step, first_step is the first logged step
+    value, and step_interval is the gap between consecutive logged steps.
+    """
+    from tensorboard.compat.proto.event_pb2 import Event
+
+    tags_in_first_step: Set[str] = set()
+    first_step: Optional[int] = None
+    with open(path, "rb") as fh:
+        for _ in range(10_000):
+            header = fh.read(_TF_RECORD_HEADER_BYTES)
+            if len(header) < _TF_RECORD_HEADER_BYTES:
+                break
+            (data_len,) = struct.unpack("<Q", header[:8])
+            data = fh.read(data_len)
+            fh.read(_TF_RECORD_FOOTER_BYTES)
+            ev = Event()
+            ev.ParseFromString(data)
+            for sv in ev.summary.value:
+                if sv.HasField("simple_value"):
+                    step = ev.step
+                    if first_step is None:
+                        first_step = step
+                        tags_in_first_step.add(sv.tag)
+                    elif step == first_step:
+                        tags_in_first_step.add(sv.tag)
+                    else:
+                        rps = max(len(tags_in_first_step), 1)
+                        interval = max(step - first_step, 1)
+                        return rps, first_step, interval
+    rps = max(len(tags_in_first_step), 1)
+    return rps, first_step or 0, 1
+
+
+def _parse_event_step(data: bytes) -> Optional[int]:
+    """Extract step from raw Event proto bytes without full protobuf parsing.
+
+    TensorFlow always writes Event fields in field-number order:
+      field 1 wall_time (fixed64): tag byte 0x09 + 8 data bytes
+      field 2 step (varint):       tag byte 0x10 + varint bytes
+    Returns None on unexpected format, 0 for events without a step field.
+    """
+    if len(data) < 9 or data[0] != 0x09:
+        return None
+    pos = 9  # skip wall_time (1 tag byte + 8 data bytes)
+    if pos >= len(data) or data[pos] != 0x10:
+        return 0  # no step field (e.g. FileVersion events)
+    pos += 1
+    step, shift = 0, 0
+    end = min(pos + 10, len(data))  # varint is at most 10 bytes
+    while pos < end:
+        b = data[pos]; pos += 1
+        step |= (b & 0x7F) << shift; shift += 7
+        if not (b & 0x80):
+            return step
+    return None
+
+
+def _iter_tfrecord_stride_by_step(
+    path: str,
+    stride: int,
+    tail_records: int,
+    total_records: int,
+    first_step: int = 0,
+    step_interval: int = 1,
+) -> Iterator[bytes]:
+    """Yield raw event bytes from a TF record file with step-index subsampling.
+
+    Reads all records sequentially (cache-friendly, no seek-syscall overhead).
+    For each record outside the tail region the step field is extracted with a
+    fast partial decode; the record is kept only when its step index (relative
+    to first_step, divided by step_interval) is divisible by stride.
+
+    This makes stride=S mean "keep 1 in S logged steps" regardless of the raw
+    step values used by the training loop.
+
+    Records in the last tail_records positions are always yielded (full fidelity).
+    """
+    tail_start = max(0, total_records - tail_records)
+    with open(path, "rb") as fh:
+        for i in range(total_records):
+            header = fh.read(_TF_RECORD_HEADER_BYTES)
+            if len(header) < _TF_RECORD_HEADER_BYTES:
+                break
+            (data_len,) = struct.unpack("<Q", header[:8])
+            data = fh.read(data_len)
+            fh.read(_TF_RECORD_FOOTER_BYTES)
+
+            if i >= tail_start:
+                yield data
+            else:
+                step = _parse_event_step(data)
+                if step is not None:
+                    step_idx = (step - first_step) // step_interval if step_interval > 0 else step
+                    if step_idx % stride == 0:
+                        yield data
+
+
+def _find_event_files(run_dir: Path) -> List[str]:
+    return sorted(
+        str(p) for p in run_dir.iterdir()
+        if p.name.startswith(EVENT_FILE_PREFIX)
+    )
+
+
+def load_scalars_fast(
+    runs: Sequence[Path],
+    stride: int = 10,
+    tail: int = 500,
+) -> Dict[str, Dict[str, List[ScalarPoint]]]:
+    """
+    Like load_scalars but uses stride subsampling for much faster loading.
+
+    For each event file: one seek-only pass counts records, then one sequential
+    read pass extracts the step field cheaply and only does a full protobuf
+    parse for steps matching step % stride == 0 plus the last
+    (tail * tags_per_step) records at full fidelity.
+    """
+    from tensorboard.compat.proto.event_pb2 import Event
+
+    loaded: Dict[str, Dict[str, List[ScalarPoint]]] = {}
+    for run in runs:
+        run_data: Dict[str, List[ScalarPoint]] = {}
+        for event_file in _find_event_files(run):
+            total = _count_tfrecord_events(event_file)
+            if total == 0:
+                continue
+            rps, first_step, step_interval = _scan_step_info(event_file)
+            tail_records = tail * rps
+
+            for raw in _iter_tfrecord_stride_by_step(
+                event_file, stride, tail_records, total, first_step, step_interval
+            ):
+                ev = Event()
+                ev.ParseFromString(raw)
+                for sv in ev.summary.value:
+                    if sv.HasField("simple_value"):
+                        run_data.setdefault(sv.tag, []).append(ScalarPoint(
+                            step=int(ev.step),
+                            value=float(sv.simple_value),
+                            wall_time=float(ev.wall_time),
+                        ))
+
+        loaded[str(run)] = run_data
     return loaded
 
 
@@ -374,6 +543,26 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default="plotext",
         help="Plot style: 'plotext' (line chart, default), 'sparkline' (compact block chars), or 'ascii' (asciichartpy per-run charts)",
     )
+    fast = parser.add_argument_group("fast loading")
+    fast.add_argument(
+        "--fast-load",
+        action="store_true",
+        help="Enable fast loading via stride subsampling (avoids parsing most records)",
+    )
+    fast.add_argument(
+        "--stride",
+        type=int,
+        default=10,
+        metavar="S",
+        help="With --fast-load: parse 1 in every S records for the history region (default: 10)",
+    )
+    fast.add_argument(
+        "--tail",
+        type=int,
+        default=500,
+        metavar="T",
+        help="With --fast-load: number of steps to keep at full fidelity at the end (default: 500)",
+    )
     return parser.parse_args(argv)
 
 
@@ -435,8 +624,10 @@ def _render_once(
     no_plot: bool,
     plot_style: str = "plotext",
     state: Optional[InteractiveState] = None,
+    loader=None,
 ) -> None:
-    loaded = load_scalars(selected_runs)
+    loader = loader or load_scalars
+    loaded = loader(selected_runs)
     _render_from_loaded(loaded, metric, no_plot, plot_style, state=state)
 
 
@@ -450,7 +641,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     all_runs = discover_runs(logdir)
     try:
         selected_runs = _resolve_selected_runs(all_runs, args.runs)
-        loaded = load_scalars(selected_runs)
+        if args.fast_load:
+            import functools
+            _loader = functools.partial(load_scalars_fast, stride=args.stride, tail=args.tail)
+        else:
+            _loader = load_scalars
+        loaded = _loader(selected_runs)
         metric_set = sorted({metric for run_data in loaded.values() for metric in run_data})
         metric = _resolve_metric(metric_set, args.metric)
     except RuntimeError as exc:
@@ -474,7 +670,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             nonlocal latest
             stop_event.wait(args.refresh)  # first load already done by main thread
             while not stop_event.is_set():
-                new_data = load_scalars(selected_runs)
+                new_data = _loader(selected_runs)
                 with data_lock:
                     latest = new_data
                 render_event.set()
@@ -524,7 +720,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             while True:
                 try:
                     clear_terminal()
-                    _render_once(selected_runs, metric, args.no_plot, args.plot_style)
+                    _render_once(selected_runs, metric, args.no_plot, args.plot_style, loader=_loader)
                 except RuntimeError as exc:
                     print(str(exc), file=sys.stderr)
                     return 1
