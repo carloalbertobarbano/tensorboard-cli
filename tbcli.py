@@ -608,7 +608,7 @@ def _render_from_loaded(
     data = _summaries_for_metric(loaded, metric)
     print(f"metric: {metric}")
     if state is not None:
-        print("  t=top  b=bottom  ↑/↓=navigate  space=highlight  ctrl+c=quit")
+        print("  t=top  b=bottom  ↑/↓=navigate  space=highlight  d=dark/light ctrl+c=quit")
     if not no_plot:
         try:
             cols, rows = os.get_terminal_size()
