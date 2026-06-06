@@ -360,6 +360,7 @@ def _render_legend(
     run_names: List[str],
     last_values: Dict[str, float],
     state: InteractiveState,
+    last_steps: Optional[Dict[str, int]] = None,
 ) -> str:
     has_highlight = bool(state.highlighted_runs)
     lines = []
@@ -378,7 +379,8 @@ def _render_legend(
             fmt = _ansi_fg(r, g, b)
 
         last_val = last_values.get(name, float("nan"))
-        lines.append(f"  {cursor_str}{fmt}{name}  {last_val:.6g}{_ANSI_RESET}")
+        step_str = f"  step={last_steps[name]}" if last_steps and name in last_steps else ""
+        lines.append(f"  {cursor_str}{fmt}{name}{step_str}  {last_val:.6g}{_ANSI_RESET}")
     return "\n".join(lines)
 
 
@@ -409,12 +411,14 @@ def render_plot_plotext(
     has_highlight = state is not None and bool(state.highlighted_runs)
     run_names = list(series.keys())
     last_values: Dict[str, float] = {}
+    last_steps: Dict[str, int] = {}
 
     for i, (run_name, points) in enumerate(series.items()):
         if not points:
             continue
         last_val = points[-1].value
         last_values[run_name] = last_val
+        last_steps[run_name] = points[-1].step
         r, g, b = _PALETTE_RGB[i % len(_PALETTE_RGB)]
 
         if has_highlight and run_name not in state.highlighted_runs:  # type: ignore[union-attr]
@@ -437,7 +441,7 @@ def render_plot_plotext(
     if state is None:
         return plot_str
 
-    legend_str = _render_legend(run_names, last_values, state)
+    legend_str = _render_legend(run_names, last_values, state, last_steps=last_steps)
     if state.legend_position == "bottom":
         return plot_str + "\n" + legend_str
     return legend_str + "\n" + plot_str
