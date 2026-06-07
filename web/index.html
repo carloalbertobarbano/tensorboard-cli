@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>tbcli</title>
+<script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #1e1e2e;
+    --surface: #2a2a3e;
+    --border: #3a3a5c;
+    --text: #cdd6f4;
+    --text-dim: #6c7086;
+    --accent: #89b4fa;
+    --header-h: 48px;
+    --toolbar-h: 44px;
+    --sidebar-w: 220px;
+    --status-h: 32px;
+  }
+
+  body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; font-size: 13px; }
+
+  /* ── Header ── */
+  #header {
+    height: var(--header-h);
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    padding: 0 16px;
+    gap: 12px;
+    position: fixed; top: 0; left: 0; right: 0; z-index: 10;
+  }
+  #header h1 { font-size: 18px; font-weight: 600; color: var(--accent); letter-spacing: 0.02em; }
+  #header .logdir { color: var(--text-dim); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* ── Toolbar ── */
+  #toolbar {
+    height: var(--toolbar-h);
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    padding: 0 12px;
+    gap: 10px;
+    position: fixed; top: var(--header-h); left: 0; right: 0; z-index: 10;
+  }
+  label { color: var(--text-dim); font-size: 12px; }
+  select, button {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 4px 8px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  select { min-width: 160px; }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  #refresh-btn { padding: 4px 12px; }
+
+  /* ── Body layout ── */
+  #body {
+    position: fixed;
+    top: calc(var(--header-h) + var(--toolbar-h));
+    bottom: var(--status-h);
+    left: 0; right: 0;
+    display: flex;
+  }
+
+  /* ── Sidebar ── */
+  #sidebar {
+    width: var(--sidebar-w);
+    flex-shrink: 0;
+    border-right: 1px solid var(--border);
+    overflow-y: auto;
+    padding: 10px 0;
+  }
+  #sidebar h2 { font-size: 11px; font-weight: 600; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.08em; padding: 0 12px 8px; }
+  .run-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 12px;
+    cursor: pointer;
+    border-radius: 0;
+    transition: background 0.1s;
+  }
+  .run-item:hover { background: var(--border); }
+  .run-item input[type=checkbox] { accent-color: var(--accent); cursor: pointer; }
+  .run-item .swatch { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+  .run-item .run-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; font-size: 12px; }
+  .sidebar-actions { display: flex; gap: 6px; padding: 8px 12px; }
+  .sidebar-actions button { font-size: 11px; padding: 3px 8px; }
+
+  /* ── Chart area ── */
+  #chart-wrap { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+  #chart { flex: 1; }
+  #no-data { display: none; flex: 1; align-items: center; justify-content: center; color: var(--text-dim); font-size: 14px; }
+
+  /* ── Status bar ── */
+  #status {
+    height: var(--status-h);
+    background: var(--surface);
+    border-top: 1px solid var(--border);
+    position: fixed; bottom: 0; left: 0; right: 0;
+    display: flex;
+    align-items: center;
+    padding: 0 12px;
+    gap: 16px;
+    font-size: 11px;
+    color: var(--text-dim);
+    overflow: hidden;
+  }
+  #status-time { flex-shrink: 0; }
+  #status-detail { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #status-err { color: #f38ba8; }
+
+  #loading-overlay {
+    position: fixed; inset: 0; z-index: 100;
+    background: rgba(30,30,46,0.88);
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 16px; font-size: 15px; color: var(--text-dim);
+  }
+  #loading-overlay.hidden { display: none; }
+  .spinner {
+    width: 36px; height: 36px;
+    border: 3px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<div id="loading-overlay">
+  <div class="spinner"></div>
+  <span id="loading-msg">Scanning runs…</span>
+</div>
+
+<div id="header">
+  <h1>tbcli</h1>
+  <span class="logdir" id="logdir-label"></span>
+</div>
+
+<div id="toolbar">
+  <label for="metric-sel">Metric</label>
+  <select id="metric-sel" onchange="onMetricChange()"></select>
+  <label for="refresh-sel">Refresh</label>
+  <select id="refresh-sel" onchange="onRefreshChange()">
+    <option value="0">off</option>
+    <option value="2">2s</option>
+    <option value="5" selected>5s</option>
+    <option value="10">10s</option>
+    <option value="30">30s</option>
+    <option value="60">60s</option>
+  </select>
+  <button id="refresh-btn" onclick="refresh()">Refresh</button>
+</div>
+
+<div id="body">
+  <div id="sidebar">
+    <h2>Runs</h2>
+    <div id="run-list"></div>
+    <div class="sidebar-actions">
+      <button onclick="selectAll()">All</button>
+      <button onclick="selectNone()">None</button>
+    </div>
+  </div>
+  <div id="chart-wrap">
+    <div id="chart"></div>
+    <div id="no-data">No data to display</div>
+  </div>
+</div>
+
+<div id="status">
+  <span id="status-time"></span>
+  <span id="status-detail"></span>
+  <span id="status-err"></span>
+</div>
+
+<script>
+const state = {
+  allRuns: [],          // [{id, name, color}]
+  selectedRuns: new Set(),
+  allMetrics: [],
+  selectedMetric: null,
+  refreshInterval: __REFRESH_DEFAULT__,
+  _timer: null,
+  _fetching: false,
+};
+
+function buildRunList() {
+  const el = document.getElementById('run-list');
+  el.innerHTML = '';
+  state.allRuns.forEach((run, i) => {
+    const item = document.createElement('div');
+    item.className = 'run-item';
+    item.innerHTML = `
+      <input type="checkbox" id="run-${i}" ${state.selectedRuns.has(run.id) ? 'checked' : ''}>
+      <span class="swatch" style="background:${run.color ?? '#888'}"></span>
+      <span class="run-name" title="${run.name}">${run.name}</span>
+    `;
+    item.querySelector('input').addEventListener('change', e => {
+      if (e.target.checked) state.selectedRuns.add(run.id);
+      else state.selectedRuns.delete(run.id);
+      refresh();
+    });
+    el.appendChild(item);
+  });
+}
+
+function buildMetricDropdown() {
+  const sel = document.getElementById('metric-sel');
+  sel.innerHTML = '';
+  state.allMetrics.forEach(m => {
+    const opt = document.createElement('option');
+    opt.value = m;
+    opt.textContent = m;
+    if (m === state.selectedMetric) opt.selected = true;
+    sel.appendChild(opt);
+  });
+}
+
+function syncRefreshDropdown() {
+  const sel = document.getElementById('refresh-sel');
+  const val = String(state.refreshInterval);
+  for (const opt of sel.options) {
+    if (opt.value === val) { opt.selected = true; break; }
+  }
+}
+
+function onMetricChange() {
+  state.selectedMetric = document.getElementById('metric-sel').value;
+  refresh();
+}
+
+function onRefreshChange() {
+  state.refreshInterval = Number(document.getElementById('refresh-sel').value);
+  scheduleAutoRefresh();
+}
+
+function scheduleAutoRefresh() {
+  clearInterval(state._timer);
+  if (state.refreshInterval > 0) {
+    state._timer = setInterval(refresh, state.refreshInterval * 1000);
+  }
+}
+
+async function refresh() {
+  if (state._fetching) return;
+  state._fetching = true;
+  setErr('');
+  try {
+    await _doRefresh();
+  } catch (e) {
+    setErr('Fetch error: ' + e.message);
+  } finally {
+    state._fetching = false;
+  }
+}
+
+async function _doRefresh() {
+  if (!state.selectedMetric) return;
+  const runs = [...state.selectedRuns].join(',');
+  const url = `/api/data?metric=${encodeURIComponent(state.selectedMetric)}&runs=${encodeURIComponent(runs)}`;
+  const data = await fetch(url).then(r => {
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return r.json();
+  });
+
+  // Attach colors from allRuns lookup
+  const colorMap = Object.fromEntries(state.allRuns.map(r => [r.id, r.color]));
+  data.series.forEach(s => { s.color = colorMap[s.run_id] ?? s.color; });
+
+  drawChart(data);
+  updateStatus(data);
+}
+
+function drawChart(data) {
+  const hasSeries = data.series.some(s => s.points.length > 0);
+  document.getElementById('chart').style.display = hasSeries ? 'block' : 'none';
+  document.getElementById('no-data').style.display = hasSeries ? 'none' : 'flex';
+  if (!hasSeries) return;
+
+  const traces = data.series
+    .filter(s => s.points.length > 0)
+    .map(s => ({
+      x: s.points.map(p => p.step),
+      y: s.points.map(p => p.value),
+      name: s.run,
+      mode: 'lines',
+      line: { color: s.color, width: 2 },
+      hovertemplate: `<b>${s.run}</b><br>step=%{x}<br>${data.metric}=%{y:.4f}<extra></extra>`,
+    }));
+
+  const layout = {
+    title: { text: data.metric, font: { color: '#cdd6f4', size: 14 } },
+    xaxis: { title: { text: 'step', font: { color: '#6c7086' } }, color: '#6c7086', gridcolor: '#3a3a5c', zerolinecolor: '#3a3a5c' },
+    yaxis: { title: { text: 'value', font: { color: '#6c7086' } }, color: '#6c7086', gridcolor: '#3a3a5c', zerolinecolor: '#3a3a5c' },
+    legend: { orientation: 'h', y: -0.18, font: { color: '#cdd6f4', size: 11 } },
+    margin: { t: 50, r: 20, b: 80, l: 60 },
+    hovermode: 'x unified',
+    paper_bgcolor: '#1e1e2e',
+    plot_bgcolor: '#1e1e2e',
+    font: { color: '#cdd6f4' },
+    hoverlabel: { bgcolor: '#2a2a3e', bordercolor: '#3a3a5c', font: { color: '#cdd6f4' } },
+  };
+
+  Plotly.react('chart', traces, layout, { responsive: true, displaylogo: false });
+}
+
+function updateStatus(data) {
+  document.getElementById('status-time').textContent =
+    'Updated ' + new Date().toLocaleTimeString();
+
+  const parts = data.series
+    .filter(s => s.points.length > 0)
+    .map(s => {
+      const last = s.points[s.points.length - 1];
+      return `${s.run}: ${last.value.toPrecision(4)} @ step ${last.step}`;
+    });
+  document.getElementById('status-detail').textContent = parts.join('  |  ');
+}
+
+function setErr(msg) {
+  document.getElementById('status-err').textContent = msg;
+}
+
+function selectAll() {
+  state.allRuns.forEach(r => state.selectedRuns.add(r.id));
+  buildRunList();
+  refresh();
+}
+
+function selectNone() {
+  state.selectedRuns.clear();
+  buildRunList();
+  refresh();
+}
+
+// Colors come from the server (mapped from _PALETTE_RGB), but we need
+// to attach them to the run list items when building run list.
+// The /api/runs endpoint doesn't include color — /api/data does.
+// So we do a quick data fetch to seed colors, or we derive them client-side.
+// Simpler: derive colors client-side matching the same _PALETTE_RGB order.
+const PALETTE = [
+  'rgb(220,80,80)', 'rgb(80,200,80)', 'rgb(80,120,220)', 'rgb(220,160,50)',
+  'rgb(180,80,220)', 'rgb(60,200,200)', 'rgb(220,220,80)', 'rgb(220,120,180)',
+];
+document.addEventListener('DOMContentLoaded', async () => {
+  const overlay = document.getElementById('loading-overlay');
+  const loadingMsg = document.getElementById('loading-msg');
+
+  let info;
+  try {
+    loadingMsg.textContent = 'Scanning event files…';
+    info = await fetch('/api/runs').then(r => {
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r.json();
+    });
+  } catch (e) {
+    loadingMsg.textContent = 'Failed to connect to tbcli server';
+    setErr(e.message);
+    return;
+  }
+
+  info.runs.forEach((r, i) => { r.color = PALETTE[i % PALETTE.length]; });
+  state.allRuns = info.runs;
+  state.allMetrics = info.metrics;
+  state.selectedMetric = info.metrics[0] ?? null;
+  state.selectedRuns = new Set(info.runs.map(r => r.id));
+
+  buildRunList();
+  buildMetricDropdown();
+  syncRefreshDropdown();
+  overlay.classList.add('hidden');
+  await refresh();
+  scheduleAutoRefresh();
+});
+</script>
+</body>
+</html>
