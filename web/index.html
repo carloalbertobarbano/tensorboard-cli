@@ -95,6 +95,20 @@
   .run-item .run-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; font-size: 12px; }
   .sidebar-actions { display: flex; gap: 6px; padding: 8px 12px; }
   .sidebar-actions button { font-size: 11px; padding: 3px 8px; }
+  #run-filter {
+    display: block;
+    width: calc(100% - 24px);
+    margin: 0 12px 6px;
+    padding: 4px 8px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text);
+    font-size: 12px;
+    outline: none;
+  }
+  #run-filter:focus { border-color: var(--accent); }
+  #run-filter.invalid { border-color: #f38ba8; }
 
   /* ── Chart area ── */
   #chart-wrap { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
@@ -166,6 +180,7 @@
 <div id="body">
   <div id="sidebar">
     <h2>Runs</h2>
+    <input type="text" id="run-filter" placeholder="Filter runs…" autocomplete="off" spellcheck="false">
     <div id="run-list"></div>
     <div class="sidebar-actions">
       <button onclick="selectAll()">All</button>
@@ -195,10 +210,23 @@ const state = {
   _fetching: false,
 };
 
+function getVisibleRuns() {
+  const filterEl = document.getElementById('run-filter');
+  const raw = filterEl.value;
+  let regex = null;
+  try {
+    regex = raw ? new RegExp(raw, 'i') : null;
+    filterEl.classList.remove('invalid');
+  } catch {
+    filterEl.classList.add('invalid');
+  }
+  return regex ? state.allRuns.filter(r => regex.test(r.name)) : state.allRuns;
+}
+
 function buildRunList() {
   const el = document.getElementById('run-list');
   el.innerHTML = '';
-  state.allRuns.forEach((run, i) => {
+  getVisibleRuns().forEach((run, i) => {
     const item = document.createElement('div');
     item.className = 'run-item';
     item.innerHTML = `
@@ -267,7 +295,8 @@ async function refresh() {
 
 async function _doRefresh() {
   if (!state.selectedMetric) return;
-  const runs = [...state.selectedRuns].join(',');
+  const visibleIds = new Set(getVisibleRuns().map(r => r.id));
+  const runs = [...state.selectedRuns].filter(id => visibleIds.has(id)).join(',');
   const url = `/api/data?metric=${encodeURIComponent(state.selectedMetric)}&runs=${encodeURIComponent(runs)}`;
   const data = await fetch(url).then(r => {
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -333,13 +362,13 @@ function setErr(msg) {
 }
 
 function selectAll() {
-  state.allRuns.forEach(r => state.selectedRuns.add(r.id));
+  getVisibleRuns().forEach(r => state.selectedRuns.add(r.id));
   buildRunList();
   refresh();
 }
 
 function selectNone() {
-  state.selectedRuns.clear();
+  getVisibleRuns().forEach(r => state.selectedRuns.delete(r.id));
   buildRunList();
   refresh();
 }
@@ -376,6 +405,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   state.selectedMetric = info.metrics[0] ?? null;
   state.selectedRuns = new Set(info.runs.map(r => r.id));
 
+  document.getElementById('run-filter').addEventListener('input', () => { buildRunList(); refresh(); });
   buildRunList();
   buildMetricDropdown();
   syncRefreshDropdown();
