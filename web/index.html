@@ -322,7 +322,7 @@ function drawChart(data) {
     .map(s => ({
       x: s.points.map(p => p.step),
       y: s.points.map(p => p.value),
-      name: s.run,
+      name: (() => { const last = s.points[s.points.length - 1]; return `${s.run}  ${last.value.toPrecision(4)} @ step ${last.step}`; })(),
       mode: 'lines',
       line: { color: s.color, width: 2 },
       hovertemplate: `<b>${s.run}</b><br>step=%{x}<br>${data.metric}=%{y:.4f}<extra></extra>`,
@@ -332,8 +332,8 @@ function drawChart(data) {
     title: { text: data.metric, font: { color: '#cdd6f4', size: 14 } },
     xaxis: { title: { text: 'step', font: { color: '#6c7086' } }, color: '#6c7086', gridcolor: '#3a3a5c', zerolinecolor: '#3a3a5c' },
     yaxis: { title: { text: 'value', font: { color: '#6c7086' } }, color: '#6c7086', gridcolor: '#3a3a5c', zerolinecolor: '#3a3a5c' },
-    legend: { orientation: 'h', y: -0.18, font: { color: '#cdd6f4', size: 11 } },
-    margin: { t: 50, r: 20, b: 80, l: 60 },
+    legend: { orientation: 'h', y: -0.22, font: { color: '#cdd6f4', size: 11 } },
+    margin: { t: 50, r: 20, b: 100, l: 60 },
     hovermode: 'x unified',
     paper_bgcolor: '#1e1e2e',
     plot_bgcolor: '#1e1e2e',
@@ -347,14 +347,7 @@ function drawChart(data) {
 function updateStatus(data) {
   document.getElementById('status-time').textContent =
     'Updated ' + new Date().toLocaleTimeString();
-
-  const parts = data.series
-    .filter(s => s.points.length > 0)
-    .map(s => {
-      const last = s.points[s.points.length - 1];
-      return `${s.run}: ${last.value.toPrecision(4)} @ step ${last.step}`;
-    });
-  document.getElementById('status-detail').textContent = parts.join('  |  ');
+  document.getElementById('status-detail').textContent = '';
 }
 
 function setErr(msg) {
