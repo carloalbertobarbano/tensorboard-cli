@@ -109,6 +109,8 @@
   }
   #run-filter:focus { border-color: var(--accent); }
   #run-filter.invalid { border-color: #f38ba8; }
+  #sort-row { display: flex; align-items: center; gap: 6px; padding: 0 12px 8px; }
+  #sort-row select { min-width: 0; flex: 1; }
 
   /* ── Chart area ── */
   #chart-wrap { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
@@ -181,6 +183,13 @@
   <div id="sidebar">
     <h2>Runs</h2>
     <input type="text" id="run-filter" placeholder="Filter runs…" autocomplete="off" spellcheck="false">
+    <div id="sort-row">
+      <label for="sort-sel">Sort</label>
+      <select id="sort-sel" onchange="onSortChange()">
+        <option value="name" selected>Name</option>
+        <option value="created">Created (newest)</option>
+      </select>
+    </div>
     <div id="run-list"></div>
     <div class="sidebar-actions">
       <button onclick="selectAll()">All</button>
@@ -205,9 +214,11 @@ const state = {
   selectedRuns: new Set(),
   allMetrics: [],
   selectedMetric: null,
+  sortBy: 'name',
   refreshInterval: __REFRESH_DEFAULT__,
   _timer: null,
   _fetching: false,
+  _lastData: null,
 };
 
 function getVisibleRuns() {
@@ -220,7 +231,18 @@ function getVisibleRuns() {
   } catch {
     filterEl.classList.add('invalid');
   }
-  return regex ? state.allRuns.filter(r => regex.test(r.name)) : state.allRuns;
+  const filtered = regex ? state.allRuns.filter(r => regex.test(r.name)) : state.allRuns;
+  return sortRuns(filtered);
+}
+
+// Comparator for two {name, created} items based on the active sort.
+function runComparator(a, b) {
+  if (state.sortBy === 'created') return (b.created ?? 0) - (a.created ?? 0);
+  return a.name.localeCompare(b.name);
+}
+
+function sortRuns(runs) {
+  return [...runs].sort(runComparator);
 }
 
 function buildRunList() {
@@ -268,6 +290,14 @@ function onMetricChange() {
   refresh();
 }
 
+function onSortChange() {
+  state.sortBy = document.getElementById('sort-sel').value;
+  buildRunList();
+  // Reorder the legend without refetching; fall back to a fetch if no data yet.
+  if (state._lastData) drawChart(state._lastData);
+  else refresh();
+}
+
 function onRefreshChange() {
   state.refreshInterval = Number(document.getElementById('refresh-sel').value);
   scheduleAutoRefresh();
@@ -312,13 +342,20 @@ async function _doRefresh() {
 }
 
 function drawChart(data) {
+  state._lastData = data;
   const hasSeries = data.series.some(s => s.points.length > 0);
   document.getElementById('chart').style.display = hasSeries ? 'block' : 'none';
   document.getElementById('no-data').style.display = hasSeries ? 'none' : 'flex';
   if (!hasSeries) return;
 
+  // Legend follows trace order; sort series to match the sidebar sort.
+  const createdMap = Object.fromEntries(state.allRuns.map(r => [r.id, r.created]));
   const traces = data.series
     .filter(s => s.points.length > 0)
+    .sort((a, b) => runComparator(
+      { name: a.run, created: createdMap[a.run_id] },
+      { name: b.run, created: createdMap[b.run_id] },
+    ))
     .map(s => ({
       x: s.points.map(p => p.step),
       y: s.points.map(p => p.value),

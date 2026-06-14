@@ -244,6 +244,33 @@ def _find_event_files(run_dir: Path) -> List[str]:
     )
 
 
+def _run_created_time(run_dir: Path) -> float:
+    """Return the run's creation time (unix seconds).
+
+    TensorBoard event filenames embed the creation timestamp right after the
+    prefix (events.out.tfevents.<unixtime>.<host>...), giving a reliable,
+    cross-platform value. Use the earliest across event files; fall back to the
+    filesystem mtime if no timestamp can be parsed.
+    """
+    event_files = _find_event_files(run_dir)
+    times: List[float] = []
+    for path in event_files:
+        name = Path(path).name
+        stamp = name[len(EVENT_FILE_PREFIX):].split(".", 1)[0]
+        try:
+            times.append(float(stamp))
+        except ValueError:
+            continue
+    if times:
+        return min(times)
+    try:
+        if event_files:
+            return min(os.path.getmtime(p) for p in event_files)
+        return os.path.getmtime(run_dir)
+    except OSError:
+        return 0.0
+
+
 def load_scalars_fast(
     runs: Sequence[Path],
     stride: int = 10,
@@ -580,7 +607,10 @@ class TBRequestHandler:
         if metrics_ready is not None:
             metrics_ready.wait(timeout=120)
         all_runs = state["all_run_paths"]
-        runs_payload = [{"id": str(r), "name": r.name} for r in all_runs]
+        runs_payload = [
+            {"id": str(r), "name": r.name, "created": _run_created_time(r)}
+            for r in all_runs
+        ]
         self._send_json({"runs": runs_payload, "metrics": state.get("all_metrics", [])})
 
     def _api_data(self, params: dict) -> None:
