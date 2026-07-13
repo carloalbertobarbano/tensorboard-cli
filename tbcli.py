@@ -313,6 +313,75 @@ def load_scalars_fast(
     return loaded
 
 
+def load_metric(
+    runs: Sequence[Path],
+    only: Optional[Set[str]] = None,
+    stride: int = 1,
+    tail: Optional[int] = None,
+) -> Tuple[Dict[str, Dict[str, List[ScalarPoint]]], Set[str]]:
+    """Load scalar points for the given tag(s) only, and discover all tags present.
+
+    Single pass per event file: parses stride-matching records (plus a full-fidelity
+    tail window when ``tail`` is not None), appends points only for tags in ``only``
+    (or all tags when ``only`` is None), and collects every tag name seen into the
+    returned set. With ``stride=1`` and ``tail=None`` every record is parsed at full
+    fidelity.
+
+    Falls back to the EventAccumulator per file when the raw byte-seek parser fails
+    (e.g. compressed TFRecord), so compressed event files still load correctly.
+    """
+    from tensorboard.compat.proto.event_pb2 import Event
+
+    only_norm = only if only is None else set(only)
+    loaded: Dict[str, Dict[str, List[ScalarPoint]]] = {}
+    seen_tags: Set[str] = set()
+
+    for run in runs:
+        run_data: Dict[str, List[ScalarPoint]] = {}
+        for event_file in _find_event_files(run):
+            try:
+                total = _count_tfrecord_events(event_file)
+                if total == 0:
+                    continue
+                rps, first_step, step_interval = _scan_step_info(event_file)
+                tail_records = tail * rps if tail is not None else 0
+                for raw in _iter_tfrecord_stride_by_step(
+                    event_file, stride, tail_records, total, first_step, step_interval
+                ):
+                    ev = Event()
+                    ev.ParseFromString(raw)
+                    for sv in ev.summary.value:
+                        if not sv.HasField("simple_value"):
+                            continue
+                        seen_tags.add(sv.tag)
+                        if only_norm is not None and sv.tag not in only_norm:
+                            continue
+                        run_data.setdefault(sv.tag, []).append(ScalarPoint(
+                            step=int(ev.step),
+                            value=float(sv.simple_value),
+                            wall_time=float(ev.wall_time),
+                        ))
+            except Exception:
+                # Compressed/unsupported file — fall back to EventAccumulator, which
+                # loads all tags but we read only the requested ones.
+                acc = _event_accumulator()(event_file)
+                acc.Reload()
+                for tag in acc.Tags().get("scalars", []):
+                    seen_tags.add(tag)
+                    if only_norm is not None and tag not in only_norm:
+                        continue
+                    run_data.setdefault(tag, []).extend(
+                        ScalarPoint(
+                            step=int(event.step),
+                            value=float(event.value),
+                            wall_time=float(event.wall_time),
+                        )
+                        for event in acc.Scalars(tag)
+                    )
+        loaded[str(run)] = run_data
+    return loaded, seen_tags
+
+
 def parse_selection(raw: str, total: int) -> List[int]:
     tokens = [token.strip() for token in raw.split(",") if token.strip()]
     if any(token.lower() in {"all", "*"} for token in tokens):
@@ -611,7 +680,11 @@ class TBRequestHandler:
             {"id": str(r), "name": r.name, "created": _run_created_time(r)}
             for r in all_runs
         ]
-        self._send_json({"runs": runs_payload, "metrics": state.get("all_metrics", [])})
+        self._send_json({
+            "runs": runs_payload,
+            "metrics": state.get("all_metrics", []),
+            "selected_metric": state.get("selected_metric"),
+        })
 
     def _api_data(self, params: dict) -> None:
         import json
@@ -626,11 +699,39 @@ class TBRequestHandler:
         all_metrics: List[str] = state.get("all_metrics", [])
         metric = params.get("metric", [None])[0] or (all_metrics[0] if all_metrics else None)
 
-        # Read from the shared cache populated by the background reload thread
         data_lock = state.get("data_lock")
-        with data_lock:
-            cached = state.get("cached_data", {})
-            loaded = {str(r): cached.get(str(r), {}) for r in requested}
+
+        if state.get("lazy"):
+            # Lazy mode: load only the requested metric on demand with a per-metric TTL.
+            # snapshot maps run_key -> {tag: [ScalarPoint]} for the loaded metric only.
+            snapshot: Dict[str, Dict[str, List[ScalarPoint]]] = {}
+            if metric is not None:
+                need_load = False
+                with data_lock:
+                    cache = state.get("cache", {})
+                    cache_time = state.get("cache_time", {})
+                    if metric in cache and (time.monotonic() - cache_time[metric]) < state["ttl"]:
+                        snapshot = {str(r): cache[metric].get(str(r), {}) for r in requested}
+                    else:
+                        need_load = True
+                if need_load:
+                    new_data, seen_tags = load_metric(
+                        all_run_paths, only={metric}, stride=state["stride"], tail=state["tail"]
+                    )
+                    with data_lock:
+                        state["cache"][metric] = new_data
+                        state["cache_time"][metric] = time.monotonic()
+                        if seen_tags:
+                            state["discovered_tags"].update(seen_tags)
+                            state["all_metrics"] = sorted(state["discovered_tags"])
+                        snapshot = {str(r): new_data.get(str(r), {}) for r in requested}
+            loaded = snapshot
+            all_metrics = state.get("all_metrics", [])
+        else:
+            # Read from the shared cache populated by the background reload thread
+            with data_lock:
+                cached = state.get("cached_data", {})
+                loaded = {str(r): cached.get(str(r), {}) for r in requested}
 
         series = []
         for run_path in requested:
@@ -645,7 +746,11 @@ class TBRequestHandler:
                 "points": [{"step": p.step, "value": p.value, "wall_time": p.wall_time} for p in points],
             })
 
-        self._send_json({"metric": metric, "series": series})
+        self._send_json({
+            "metric": metric,
+            "series": series,
+            "metrics": state.get("all_metrics", []),
+        })
 
     def log_message(self, fmt: str, *args: object) -> None:
         pass  # suppress per-request access log
@@ -681,29 +786,73 @@ def run_web_server(args: "argparse.Namespace", logdir: Path) -> int:
     class Handler(TBRequestHandler, http.server.BaseHTTPRequestHandler):
         pass
 
-    Handler.server_state = {
-        "all_run_paths": all_run_paths,
-        "loader": loader,
-        "args": args,
-        "all_metrics": [],
-        "cached_data": {},
-        "metrics_ready": metrics_ready,
-        "data_lock": data_lock,
-    }
-    Handler._html_page = html_page
+    lazy = bool(args.metric)
 
-    def _bg_reload() -> None:
-        """Load data once, signal metrics ready, then keep refreshing on interval."""
-        while True:
-            new_data = loader(all_run_paths)
+    if lazy:
+        # Lazy mode: only the viewed metric's points are loaded, on demand. The metric
+        # list (for the dropdown) is discovered during these loads. An initial load of
+        # the requested --metric primes the cache and unblocks /api/runs quickly.
+        stride = args.stride if args.fast_load else 1
+        tail = args.tail if args.fast_load else None
+        Handler.server_state = {
+            "all_run_paths": all_run_paths,
+            "lazy": True,
+            "selected_metric": args.metric,
+            "stride": stride,
+            "tail": tail,
+            "ttl": max(args.refresh, 1.0),
+            "all_metrics": [],
+            "cache": {},          # metric -> {run_key: [ScalarPoint]}
+            "cache_time": {},     # metric -> monotonic seconds
+            "discovered_tags": set(),
+            "metrics_ready": metrics_ready,
+            "data_lock": data_lock,
+        }
+
+        def _bg_prime() -> None:
+            """Load the requested --metric once, then exit; further loads are on demand."""
+            new_data, seen_tags = load_metric(
+                all_run_paths, only={args.metric}, stride=stride, tail=tail
+            )
             with data_lock:
-                Handler.server_state["cached_data"] = new_data
-                if not metrics_ready.is_set():
+                Handler.server_state["cache"][args.metric] = new_data
+                Handler.server_state["cache_time"][args.metric] = time.monotonic()
+                if seen_tags:
+                    Handler.server_state["discovered_tags"].update(seen_tags)
                     Handler.server_state["all_metrics"] = sorted(
-                        {m for run_data in new_data.values() for m in run_data}
+                        Handler.server_state["discovered_tags"]
                     )
             metrics_ready.set()
-            time.sleep(max(1.0, args.refresh))
+
+        bg_target = _bg_prime
+    else:
+        Handler.server_state = {
+            "all_run_paths": all_run_paths,
+            "lazy": False,
+            "loader": loader,
+            "args": args,
+            "all_metrics": [],
+            "cached_data": {},
+            "metrics_ready": metrics_ready,
+            "data_lock": data_lock,
+        }
+
+        def _bg_reload() -> None:
+            """Load data once, signal metrics ready, then keep refreshing on interval."""
+            while True:
+                new_data = loader(all_run_paths)
+                with data_lock:
+                    Handler.server_state["cached_data"] = new_data
+                    if not metrics_ready.is_set():
+                        Handler.server_state["all_metrics"] = sorted(
+                            {m for run_data in new_data.values() for m in run_data}
+                        )
+                metrics_ready.set()
+                time.sleep(max(1.0, args.refresh))
+
+        bg_target = _bg_reload
+
+    Handler._html_page = html_page
 
     addr = ("127.0.0.1", args.port)
     try:
@@ -713,7 +862,7 @@ def run_web_server(args: "argparse.Namespace", logdir: Path) -> int:
         print(f"Try --port {args.port + 1}", file=sys.stderr)
         return 1
 
-    threading.Thread(target=_bg_reload, daemon=True).start()
+    threading.Thread(target=bg_target, daemon=True).start()
 
     url = f"http://127.0.0.1:{args.port}"
     print(f"tbcli web UI → {url}")

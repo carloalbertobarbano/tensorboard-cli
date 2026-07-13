@@ -337,6 +337,18 @@ async function _doRefresh() {
   const colorMap = Object.fromEntries(state.allRuns.map(r => [r.id, r.color]));
   data.series.forEach(s => { s.color = colorMap[s.run_id] ?? s.color; });
 
+  // Merge any newly-discovered metric tags (lazy mode) into the dropdown.
+  if (Array.isArray(data.metrics) && data.metrics.length) {
+    let added = false;
+    for (const m of data.metrics) {
+      if (!state.allMetrics.includes(m)) { state.allMetrics.push(m); added = true; }
+    }
+    if (added) {
+      state.allMetrics.sort();
+      buildMetricDropdown();
+    }
+  }
+
   drawChart(data);
   updateStatus(data);
 }
@@ -432,7 +444,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   info.runs.forEach((r, i) => { r.color = PALETTE[i % PALETTE.length]; });
   state.allRuns = info.runs;
   state.allMetrics = info.metrics;
-  state.selectedMetric = info.metrics[0] ?? null;
+  state.selectedMetric = info.selected_metric ?? info.metrics[0] ?? null;
   state.selectedRuns = new Set(info.runs.map(r => r.id));
 
   document.getElementById('run-filter').addEventListener('input', () => { buildRunList(); refresh(); });
