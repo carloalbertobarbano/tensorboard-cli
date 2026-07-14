@@ -620,8 +620,8 @@ class TBRequestHandler:
         all_run_paths: List[Path] = state["all_run_paths"]
 
         run_ids_raw = params.get("runs", [""])[0]
-        run_id_set = set(filter(None, run_ids_raw.split(","))) if run_ids_raw else set()
-        requested = [r for r in all_run_paths if str(r) in run_id_set] if run_id_set else list(all_run_paths)
+        run_id_set = set(filter(None, run_ids_raw.split(",")))
+        requested = [r for r in all_run_paths if str(r) in run_id_set]
 
         all_metrics: List[str] = state.get("all_metrics", [])
         metric = params.get("metric", [None])[0] or (all_metrics[0] if all_metrics else None)

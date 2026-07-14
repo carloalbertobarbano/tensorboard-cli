@@ -176,6 +176,13 @@
     <option value="30">30s</option>
     <option value="60">60s</option>
   </select>
+  <label for="limit-sel">Show</label>
+  <select id="limit-sel" onchange="onLimitChange()">
+    <option value="10">last 10</option>
+    <option value="20">last 20</option>
+    <option value="50">last 50</option>
+    <option value="0" selected>all</option>
+  </select>
   <button id="refresh-btn" onclick="refresh()">Refresh</button>
 </div>
 
@@ -215,6 +222,7 @@ const state = {
   allMetrics: [],
   selectedMetric: null,
   sortBy: 'name',
+  runLimit: 0,          // 0 = all, otherwise last N runs by creation time
   refreshInterval: __REFRESH_DEFAULT__,
   _timer: null,
   _fetching: false,
@@ -231,7 +239,12 @@ function getVisibleRuns() {
   } catch {
     filterEl.classList.add('invalid');
   }
-  const filtered = regex ? state.allRuns.filter(r => regex.test(r.name)) : state.allRuns;
+  let filtered = regex ? state.allRuns.filter(r => regex.test(r.name)) : [...state.allRuns];
+  // Limit to the most recent N runs (by creation time) before applying the display sort.
+  if (state.runLimit > 0) {
+    filtered.sort((a, b) => (b.created ?? 0) - (a.created ?? 0));
+    filtered = filtered.slice(0, state.runLimit);
+  }
   return sortRuns(filtered);
 }
 
@@ -285,6 +298,14 @@ function syncRefreshDropdown() {
   }
 }
 
+function syncLimitDropdown() {
+  const sel = document.getElementById('limit-sel');
+  const val = state.runLimit === 0 ? '0' : String(state.runLimit);
+  for (const opt of sel.options) {
+    if (opt.value === val) { opt.selected = true; break; }
+  }
+}
+
 function onMetricChange() {
   state.selectedMetric = document.getElementById('metric-sel').value;
   refresh();
@@ -301,6 +322,13 @@ function onSortChange() {
 function onRefreshChange() {
   state.refreshInterval = Number(document.getElementById('refresh-sel').value);
   scheduleAutoRefresh();
+}
+
+function onLimitChange() {
+  const val = Number(document.getElementById('limit-sel').value);
+  state.runLimit = val === 0 ? 0 : val;
+  buildRunList();
+  refresh();
 }
 
 function scheduleAutoRefresh() {
@@ -365,12 +393,17 @@ function drawChart(data) {
       hovertemplate: `<b>${s.run}</b><br>step=%{x}<br>${data.metric}=%{y:.4f}<extra></extra>`,
     }));
 
+  const n = traces.length;
+  const legendFontSize = n <= 10 ? 12 : n <= 20 ? 11 : n <= 50 ? 10 : 9;
+  // Horizontal legend: reserve more bottom margin as the run count grows.
+  const bottomMargin = n <= 10 ? 90 : n <= 20 ? 110 : n <= 50 ? 140 : 180;
+
   const layout = {
     title: { text: data.metric, font: { color: '#cdd6f4', size: 14 } },
     xaxis: { title: { text: 'step', font: { color: '#6c7086' } }, color: '#6c7086', gridcolor: '#3a3a5c', zerolinecolor: '#3a3a5c' },
     yaxis: { title: { text: 'value', font: { color: '#6c7086' } }, color: '#6c7086', gridcolor: '#3a3a5c', zerolinecolor: '#3a3a5c' },
-    legend: { orientation: 'h', y: -0.22, font: { color: '#cdd6f4', size: 11 } },
-    margin: { t: 50, r: 20, b: 100, l: 60 },
+    legend: { orientation: 'h', y: -0.22, font: { color: '#cdd6f4', size: legendFontSize } },
+    margin: { t: 50, r: 20, b: bottomMargin, l: 60 },
     hovermode: 'x unified',
     paper_bgcolor: '#1e1e2e',
     plot_bgcolor: '#1e1e2e',
@@ -439,6 +472,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   buildRunList();
   buildMetricDropdown();
   syncRefreshDropdown();
+  syncLimitDropdown();
   overlay.classList.add('hidden');
   await refresh();
   scheduleAutoRefresh();
