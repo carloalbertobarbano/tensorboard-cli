@@ -83,6 +83,29 @@ def discover_runs(logdir: Path) -> List[Path]:
     return sorted(runs)
 
 
+def filter_runs_by_patterns(
+    runs: Sequence[Path], patterns_raw: str
+) -> List[Path]:
+    """Keep only runs whose name or path matches one of the comma-separated
+    wildcard patterns (fnmatch-style, e.g. ``*exp1*,2024*``).
+
+    A bare ``*`` or ``all`` (case-insensitive) matches every run, so callers can
+    pass the same value they'd give the index-based selector.
+    """
+    import fnmatch
+
+    tokens = [t.strip() for t in patterns_raw.split(",") if t.strip()]
+    if any(tok.lower() in {"all", "*"} for tok in tokens):
+        return list(runs)
+    kept: List[Path] = []
+    for run in runs:
+        name = run.name
+        path_str = str(run)
+        if any(fnmatch.fnmatch(name, tok) or fnmatch.fnmatch(path_str, tok) for tok in tokens):
+            kept.append(run)
+    return kept
+
+
 def _event_accumulator():
     try:
         from tensorboard.backend.event_processing.event_accumulator import (
@@ -661,6 +684,15 @@ def run_web_server(args: "argparse.Namespace", logdir: Path) -> int:
         print(f"No TensorBoard runs found in {logdir}", file=sys.stderr)
         return 1
 
+    if args.runs:
+        all_run_paths = filter_runs_by_patterns(all_run_paths, args.runs)
+        if not all_run_paths:
+            print(
+                f"No runs match --runs {args.runs!r} in {logdir}",
+                file=sys.stderr,
+            )
+            return 1
+
     if args.fast_load:
         loader = functools.partial(load_scalars_fast, stride=args.stride, tail=args.tail)
     else:
@@ -732,7 +764,13 @@ def run_web_server(args: "argparse.Namespace", logdir: Path) -> int:
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Minimal TensorBoard log viewer")
     parser.add_argument("logdir", help="TensorBoard log directory")
-    parser.add_argument("--runs", help="Comma-separated run indexes or all/*")
+    parser.add_argument(
+        "--runs",
+        help="In CLI mode: comma-separated run indexes or all/*. "
+             "In --web mode: comma-separated wildcard patterns (fnmatch, e.g. "
+             "'*exp1*,2024*') matched against run name or path; only matching "
+             "runs are loaded (speeds up startup on large log directories).",
+    )
     parser.add_argument("--metric", help="Metric tag to preselect")
     parser.add_argument("--refresh", type=float, default=5.0, help="Auto-refresh interval seconds")
     parser.add_argument("--once", action="store_true", help="Render once and exit")
