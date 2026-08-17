@@ -83,6 +83,29 @@ def discover_runs(logdir: Path) -> List[Path]:
     return sorted(runs)
 
 
+def filter_runs_by_patterns(
+    runs: Sequence[Path], patterns_raw: str
+) -> List[Path]:
+    """Keep only runs whose name or path matches one of the comma-separated
+    wildcard patterns (fnmatch-style, e.g. ``*exp1*,2024*``).
+
+    A bare ``*`` or ``all`` (case-insensitive) matches every run, so callers can
+    pass the same value they'd give the index-based selector.
+    """
+    import fnmatch
+
+    tokens = [t.strip() for t in patterns_raw.split(",") if t.strip()]
+    if any(tok.lower() in {"all", "*"} for tok in tokens):
+        return list(runs)
+    kept: List[Path] = []
+    for run in runs:
+        name = run.name
+        path_str = str(run)
+        if any(fnmatch.fnmatch(name, tok) or fnmatch.fnmatch(path_str, tok) for tok in tokens):
+            kept.append(run)
+    return kept
+
+
 def _event_accumulator():
     try:
         from tensorboard.backend.event_processing.event_accumulator import (
@@ -242,6 +265,33 @@ def _find_event_files(run_dir: Path) -> List[str]:
         str(p) for p in run_dir.iterdir()
         if p.name.startswith(EVENT_FILE_PREFIX)
     )
+
+
+def _run_created_time(run_dir: Path) -> float:
+    """Return the run's creation time (unix seconds).
+
+    TensorBoard event filenames embed the creation timestamp right after the
+    prefix (events.out.tfevents.<unixtime>.<host>...), giving a reliable,
+    cross-platform value. Use the earliest across event files; fall back to the
+    filesystem mtime if no timestamp can be parsed.
+    """
+    event_files = _find_event_files(run_dir)
+    times: List[float] = []
+    for path in event_files:
+        name = Path(path).name
+        stamp = name[len(EVENT_FILE_PREFIX):].split(".", 1)[0]
+        try:
+            times.append(float(stamp))
+        except ValueError:
+            continue
+    if times:
+        return min(times)
+    try:
+        if event_files:
+            return min(os.path.getmtime(p) for p in event_files)
+        return os.path.getmtime(run_dir)
+    except OSError:
+        return 0.0
 
 
 def load_scalars_fast(
@@ -533,10 +583,194 @@ def _handle_key(key: str, state: InteractiveState, run_names: List[str]) -> bool
     return False
 
 
+class TBRequestHandler:
+    """HTTP request handler for the web UI — mixed in with BaseHTTPRequestHandler at runtime."""
+
+    server_state: dict = {}
+    _html_page: str = ""
+
+    def do_GET(self) -> None:
+        import urllib.parse
+
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        if path == "/":
+            self._serve_html()
+        elif path == "/api/runs":
+            self._api_runs()
+        elif path == "/api/data":
+            params = urllib.parse.parse_qs(parsed.query)
+            self._api_data(params)
+        else:
+            self.send_error(404)
+
+    def _serve_html(self) -> None:
+        body = self.__class__._html_page.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_json(self, obj: object) -> None:
+        import json
+
+        body = json.dumps(obj).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _api_runs(self) -> None:
+        state = self.__class__.server_state
+        # Wait for background metric probe to finish (blocks this request thread only)
+        metrics_ready = state.get("metrics_ready")
+        if metrics_ready is not None:
+            metrics_ready.wait(timeout=120)
+        all_runs = state["all_run_paths"]
+        runs_payload = [
+            {"id": str(r), "name": r.name, "created": _run_created_time(r)}
+            for r in all_runs
+        ]
+        self._send_json({"runs": runs_payload, "metrics": state.get("all_metrics", [])})
+
+    def _api_data(self, params: dict) -> None:
+        import json
+
+        state = self.__class__.server_state
+        all_run_paths: List[Path] = state["all_run_paths"]
+
+        run_ids_raw = params.get("runs", [""])[0]
+        run_id_set = set(filter(None, run_ids_raw.split(",")))
+        requested = [r for r in all_run_paths if str(r) in run_id_set]
+
+        all_metrics: List[str] = state.get("all_metrics", [])
+        metric = params.get("metric", [None])[0] or (all_metrics[0] if all_metrics else None)
+
+        # Read from the shared cache populated by the background reload thread
+        data_lock = state.get("data_lock")
+        with data_lock:
+            cached = state.get("cached_data", {})
+            loaded = {str(r): cached.get(str(r), {}) for r in requested}
+
+        series = []
+        for run_path in requested:
+            run_key = str(run_path)
+            palette_idx = all_run_paths.index(run_path) % len(_PALETTE_RGB)
+            r, g, b = _PALETTE_RGB[palette_idx]
+            points = loaded.get(run_key, {}).get(metric, []) if metric else []
+            series.append({
+                "run": run_path.name,
+                "run_id": run_key,
+                "color": f"rgb({r},{g},{b})",
+                "points": [{"step": p.step, "value": p.value, "wall_time": p.wall_time} for p in points],
+            })
+
+        self._send_json({"metric": metric, "series": series})
+
+    def log_message(self, fmt: str, *args: object) -> None:
+        pass  # suppress per-request access log
+
+
+def run_web_server(args: "argparse.Namespace", logdir: Path) -> int:
+    import http.server
+    import webbrowser
+    import functools
+
+    all_run_paths = discover_runs(logdir)
+    if not all_run_paths:
+        print(f"No TensorBoard runs found in {logdir}", file=sys.stderr)
+        return 1
+
+    if args.runs:
+        all_run_paths = filter_runs_by_patterns(all_run_paths, args.runs)
+        if not all_run_paths:
+            print(
+                f"No runs match --runs {args.runs!r} in {logdir}",
+                file=sys.stderr,
+            )
+            return 1
+
+    if args.fast_load:
+        loader = functools.partial(load_scalars_fast, stride=args.stride, tail=args.tail)
+    else:
+        loader = load_scalars
+
+    html_dir = Path(__file__).parent / "web"
+    try:
+        html_page = (html_dir / "index.html").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        print(f"Web UI template not found: {html_dir / 'index.html'}", file=sys.stderr)
+        return 1
+    html_page = html_page.replace("__REFRESH_DEFAULT__", str(args.refresh))
+
+    metrics_ready = threading.Event()
+    data_lock = threading.Lock()
+
+    # Build a concrete handler class by mixing TBRequestHandler with BaseHTTPRequestHandler
+    class Handler(TBRequestHandler, http.server.BaseHTTPRequestHandler):
+        pass
+
+    Handler.server_state = {
+        "all_run_paths": all_run_paths,
+        "loader": loader,
+        "args": args,
+        "all_metrics": [],
+        "cached_data": {},
+        "metrics_ready": metrics_ready,
+        "data_lock": data_lock,
+    }
+    Handler._html_page = html_page
+
+    def _bg_reload() -> None:
+        """Load data once, signal metrics ready, then keep refreshing on interval."""
+        while True:
+            new_data = loader(all_run_paths)
+            with data_lock:
+                Handler.server_state["cached_data"] = new_data
+                if not metrics_ready.is_set():
+                    Handler.server_state["all_metrics"] = sorted(
+                        {m for run_data in new_data.values() for m in run_data}
+                    )
+            metrics_ready.set()
+            time.sleep(max(1.0, args.refresh))
+
+    addr = ("127.0.0.1", args.port)
+    try:
+        httpd = http.server.ThreadingHTTPServer(addr, Handler)
+    except OSError as exc:
+        print(f"Cannot start server on port {args.port}: {exc}", file=sys.stderr)
+        print(f"Try --port {args.port + 1}", file=sys.stderr)
+        return 1
+
+    threading.Thread(target=_bg_reload, daemon=True).start()
+
+    url = f"http://127.0.0.1:{args.port}"
+    print(f"tbcli web UI → {url}")
+    print("Press Ctrl+C to stop.")
+    webbrowser.open(url)
+
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        httpd.server_close()
+    return 0
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Minimal TensorBoard log viewer")
     parser.add_argument("logdir", help="TensorBoard log directory")
-    parser.add_argument("--runs", help="Comma-separated run indexes or all/*")
+    parser.add_argument(
+        "--runs",
+        help="In CLI mode: comma-separated run indexes or all/*. "
+             "In --web mode: comma-separated wildcard patterns (fnmatch, e.g. "
+             "'*exp1*,2024*') matched against run name or path; only matching "
+             "runs are loaded (speeds up startup on large log directories).",
+    )
     parser.add_argument("--metric", help="Metric tag to preselect")
     parser.add_argument("--refresh", type=float, default=5.0, help="Auto-refresh interval seconds")
     parser.add_argument("--once", action="store_true", help="Render once and exit")
@@ -566,6 +800,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=500,
         metavar="T",
         help="With --fast-load: number of steps to keep at full fidelity at the end (default: 500)",
+    )
+    web = parser.add_argument_group("web server")
+    web.add_argument(
+        "--web",
+        action="store_true",
+        help="Start a local HTTP server and open the TensorBoard-style web UI in the browser",
+    )
+    web.add_argument(
+        "--port",
+        type=int,
+        default=6006,
+        metavar="PORT",
+        help="Port for --web mode (default: 6006)",
     )
     return parser.parse_args(argv)
 
@@ -641,6 +888,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not logdir.exists():
         print(f"Directory does not exist: {logdir}", file=sys.stderr)
         return 2
+
+    if args.web:
+        return run_web_server(args, logdir)
 
     all_runs = discover_runs(logdir)
     try:
