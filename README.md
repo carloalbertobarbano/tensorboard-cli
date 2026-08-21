@@ -48,6 +48,12 @@ Three styles are available via `--plot-style`:
 # preselect runs and metric, faster refresh
 uv run tbcli.py /path/to/logdir --runs all --metric loss --refresh 2
 
+# select runs by wildcard pattern (fnmatch, matched against name or path)
+uv run tbcli.py /path/to/logdir --runs '*exp1*,2024*' --metric loss
+
+# mix indexes and patterns
+uv run tbcli.py /path/to/logdir --runs '1,3,*exp*' --metric loss
+
 # render once and exit, no plot
 uv run tbcli.py /path/to/logdir --once --no-plot
 
@@ -79,7 +85,7 @@ This serves the UI on `http://127.0.0.1:6006` and opens it automatically. Pick a
 uv run tbcli.py /path/to/logdir --web --port 8080
 ```
 
-In `--web` mode the `--runs` flag takes comma-separated wildcard patterns (fnmatch, e.g. `*exp1*,2024*`) matched against run name or path — only matching runs are loaded, which speeds up startup on large log directories:
+In `--web` mode the `--runs` flag takes comma-separated wildcard patterns (fnmatch, e.g. `*exp1*,2024*`) matched against run name or path — only matching runs are loaded, which speeds up startup on large log directories. This is the same pattern syntax CLI mode accepts (see above); in `--web` mode the 1-based index form is not available:
 
 ```bash
 uv run tbcli.py /path/to/logdir --web --runs '*exp1*,2024*'

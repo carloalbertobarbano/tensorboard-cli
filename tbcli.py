@@ -351,15 +351,61 @@ def parse_selection(raw: str, total: int) -> List[int]:
     return sorted(set(selected))
 
 
+def _is_index_token(token: str) -> bool:
+    try:
+        int(token)
+    except ValueError:
+        return False
+    return True
+
+
+def resolve_run_selection(runs: Sequence[Path], run_arg: str) -> List[Path]:
+    """Resolve a comma-separated ``--runs`` argument for CLI mode.
+
+    Each token is one of:
+
+    * the keyword ``all`` or ``*`` (case-insensitive) — every run;
+    * a 1-based run index (e.g. ``1``, ``3``) — the run at that position in
+      the sorted discovery list;
+    * an fnmatch wildcard pattern (e.g. ``*exp1*``, ``2024*``) matched
+      against the run name **and** full path, exactly like ``--web`` mode.
+
+    Tokens of different kinds may be mixed, e.g. ``1,3,*exp*``. A pattern
+    that matches no run raises ``ValueError`` so a typo is never silently
+    dropped. The result is returned in discovery order with duplicates
+    removed.
+    """
+    import fnmatch
+
+    tokens = [t.strip() for t in run_arg.split(",") if t.strip()]
+    if any(tok.lower() in {"all", "*"} for tok in tokens):
+        return list(runs)
+    chosen = set()
+    for tok in tokens:
+        if _is_index_token(tok):
+            idx = int(tok) - 1
+            if idx < 0 or idx >= len(runs):
+                raise ValueError(f"Invalid run index: {tok}")
+            chosen.add(runs[idx])
+        else:
+            matches = [r for r in runs
+                       if fnmatch.fnmatch(r.name, tok) or fnmatch.fnmatch(str(r), tok)]
+            if not matches:
+                raise ValueError(f"No runs match pattern: {tok!r}")
+            chosen.update(matches)
+    if not chosen:
+        raise ValueError("No valid selections provided")
+    return [r for r in runs if r in chosen]
+
+
 def prompt_run_selection(runs: Sequence[Path]) -> List[Path]:
     print("Available runs:")
     for idx, run in enumerate(runs, start=1):
         print(f"  [{idx}] {run}")
     while True:
-        raw = input("Select runs (e.g. 1,2 or all/*): ")
+        raw = input("Select runs (e.g. 1,2, *exp* or all/*): ")
         try:
-            indexes = parse_selection(raw, len(runs))
-            return [runs[i] for i in indexes]
+            return resolve_run_selection(runs, raw)
         except ValueError as exc:
             print(f"Invalid selection: {exc}")
 
@@ -766,9 +812,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("logdir", help="TensorBoard log directory")
     parser.add_argument(
         "--runs",
-        help="In CLI mode: comma-separated run indexes or all/*. "
-             "In --web mode: comma-separated wildcard patterns (fnmatch, e.g. "
-             "'*exp1*,2024*') matched against run name or path; only matching "
+        help="Comma-separated run selectors, applied in both CLI and --web "
+             "mode. Each token is a 1-based run index (CLI only, e.g. '1,3'), "
+             "an fnmatch wildcard pattern (e.g. '*exp1*,2024*') matched "
+             "against run name or path, or 'all'/'*' for every run. Tokens of "
+             "different kinds may be mixed (e.g. '1,3,*exp*'). Only matching "
              "runs are loaded (speeds up startup on large log directories).",
     )
     parser.add_argument("--metric", help="Metric tag to preselect")
@@ -821,8 +869,7 @@ def _resolve_selected_runs(all_runs: List[Path], run_arg: Optional[str]) -> List
     if not all_runs:
         raise RuntimeError("No TensorBoard runs found in the specified directory.")
     if run_arg:
-        indexes = parse_selection(run_arg, len(all_runs))
-        return [all_runs[i] for i in indexes]
+        return resolve_run_selection(all_runs, run_arg)
     if sys.stdin.isatty():
         return prompt_run_selection(all_runs)
     return all_runs
@@ -903,7 +950,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         loaded = _loader(selected_runs)
         metric_set = sorted({metric for run_data in loaded.values() for metric in run_data})
         metric = _resolve_metric(metric_set, args.metric)
-    except RuntimeError as exc:
+    except (RuntimeError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
 

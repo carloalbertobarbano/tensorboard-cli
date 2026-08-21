@@ -54,6 +54,46 @@ class TbCliTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             tbcli.parse_selection("   ", 3)
 
+    def test_resolve_run_selection_indexes(self):
+        runs = [Path("/logs/a"), Path("/logs/b"), Path("/logs/c")]
+        self.assertEqual(tbcli.resolve_run_selection(runs, "1,3"),
+                         [Path("/logs/a"), Path("/logs/c")])
+        self.assertEqual(tbcli.resolve_run_selection(runs, "all"), list(runs))
+        self.assertEqual(tbcli.resolve_run_selection(runs, "*"), list(runs))
+        # out-of-range index is an error
+        with self.assertRaises(ValueError):
+            tbcli.resolve_run_selection(runs, "4")
+        # empty input is an error
+        with self.assertRaises(ValueError):
+            tbcli.resolve_run_selection(runs, "   ")
+
+    def test_resolve_run_selection_wildcards(self):
+        runs = [Path("/logs/exp1"), Path("/logs/exp2_run"),
+                Path("/logs/2024/baseline")]
+        # pattern matched against run name
+        self.assertEqual(tbcli.resolve_run_selection(runs, "exp1"),
+                         [Path("/logs/exp1")])
+        # wildcard on name
+        self.assertEqual(tbcli.resolve_run_selection(runs, "exp*"),
+                         [Path("/logs/exp1"), Path("/logs/exp2_run")])
+        # wildcard matched against the full path
+        self.assertEqual(tbcli.resolve_run_selection(runs, "*2024*"),
+                         [Path("/logs/2024/baseline")])
+        # multiple patterns union, duplicates removed, discovery order kept
+        self.assertEqual(tbcli.resolve_run_selection(runs, "exp1,*baseline*"),
+                         [Path("/logs/exp1"), Path("/logs/2024/baseline")])
+
+    def test_resolve_run_selection_mixed(self):
+        runs = [Path("/logs/exp1"), Path("/logs/exp2"), Path("/logs/exp3")]
+        # indexes and patterns may be mixed
+        self.assertEqual(tbcli.resolve_run_selection(runs, "1,*exp3*"),
+                         [Path("/logs/exp1"), Path("/logs/exp3")])
+
+    def test_resolve_run_selection_no_match(self):
+        runs = [Path("/logs/exp1")]
+        with self.assertRaises(ValueError):
+            tbcli.resolve_run_selection(runs, "*nope*")
+
     def test_load_scalars_with_loader(self):
         FakeAccumulator.DATA = {
             "/logs/r1": {"loss": [_event(1, 0.5, 0.0), _event(2, 0.25, 1.0)]}
