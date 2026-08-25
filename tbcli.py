@@ -842,6 +842,38 @@ def run_web_server(args: "argparse.Namespace", logdir: Path) -> int:
     return 0
 
 
+def _render_latest(
+    loaded: Dict[str, Dict[str, List[ScalarPoint]]],
+) -> None:
+    """Print the latest value of every metric for every loaded run, then exit.
+
+    One block per run; metrics are sorted alphabetically. Runs without any
+    scalar data are reported as empty rather than silently skipped.
+    """
+    for run_key, metrics in loaded.items():
+        run_name = Path(run_key).name
+        print(f"{_ANSI_BOLD}{run_name}{_ANSI_RESET}")
+        if not metrics:
+            print("  (no scalar data)")
+            print()
+            continue
+        max_tag = max(len(tag) for tag in metrics)
+        for tag in sorted(metrics):
+            points = metrics[tag]
+            if not points:
+                print(f"  {tag:<{max_tag}}  (no data)")
+                continue
+            last = points[-1]
+            values = [p.value for p in points]
+            lo, hi = min(values), max(values)
+            print(
+                f"  {tag:<{max_tag}}  "
+                f"last={last.value:.6g}  step={last.step}  "
+                f"min={lo:.6g}  max={hi:.6g}  n={len(points)}"
+            )
+        print()
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Minimal TensorBoard log viewer")
     parser.add_argument("logdir", help="TensorBoard log directory")
@@ -867,6 +899,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--metric", help="Metric tag to preselect")
     parser.add_argument("--refresh", type=float, default=5.0, help="Auto-refresh interval seconds")
     parser.add_argument("--once", action="store_true", help="Render once and exit")
+    parser.add_argument(
+        "--latest",
+        action="store_true",
+        help="Print the latest value of every metric for the selected run(s) "
+             "and exit — no plot, no TUI. Useful for a quick glance without "
+             "launching the full interface.",
+    )
     parser.add_argument("--no-plot", action="store_true", help="Disable plotting")
     parser.add_argument(
         "--plot-style",
@@ -994,6 +1033,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         else:
             _loader = load_scalars
         loaded = _loader(selected_runs)
+        if args.latest:
+            _render_latest(loaded)
+            return 0
         metric_set = sorted({metric for run_data in loaded.values() for metric in run_data})
         metric = _resolve_metric(metric_set, args.metric)
     except (RuntimeError, ValueError) as exc:

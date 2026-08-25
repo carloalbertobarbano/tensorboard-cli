@@ -191,6 +191,60 @@ class TbCliTests(unittest.TestCase):
         out = tbcli.render_sparklines(series)
         self.assertIn("last=0.3", out)
 
+    # --- _render_latest tests ---
+
+    def _capture_latest(self, loaded):
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            tbcli._render_latest(loaded)
+        return buf.getvalue()
+
+    def test_render_latest_shows_all_metrics(self):
+        loaded = {
+            "/logs/run1": {
+                "loss": [tbcli.ScalarPoint(step=10, value=0.5, wall_time=0),
+                         tbcli.ScalarPoint(step=20, value=0.25, wall_time=1)],
+                "acc": [tbcli.ScalarPoint(step=10, value=0.1, wall_time=0),
+                        tbcli.ScalarPoint(step=20, value=0.9, wall_time=1)],
+            }
+        }
+        out = self._capture_latest(loaded)
+        self.assertIn("run1", out)
+        self.assertIn("loss", out)
+        self.assertIn("acc", out)
+        # latest values surfaced
+        self.assertIn("last=0.25", out)
+        self.assertIn("last=0.9", out)
+        self.assertIn("step=20", out)
+
+    def test_render_latest_sorts_metrics_and_shows_counts(self):
+        loaded = {
+            "/logs/run1": {
+                "zebra": [tbcli.ScalarPoint(step=1, value=1.0, wall_time=0)],
+                "alpha": [tbcli.ScalarPoint(step=1, value=2.0, wall_time=0),
+                          tbcli.ScalarPoint(step=2, value=3.0, wall_time=1)],
+            }
+        }
+        out = self._capture_latest(loaded)
+        # alphabetical: alpha before zebra
+        self.assertLess(out.find("alpha"), out.find("zebra"))
+        self.assertIn("n=2", out)
+        self.assertIn("n=1", out)
+
+    def test_render_latest_empty_run(self):
+        out = self._capture_latest({"/logs/run1": {}})
+        self.assertIn("no scalar data", out)
+
+    def test_render_latest_multiple_runs(self):
+        loaded = {
+            "/logs/a": {"loss": [tbcli.ScalarPoint(step=1, value=0.5, wall_time=0)]},
+            "/logs/b": {"loss": [tbcli.ScalarPoint(step=1, value=0.4, wall_time=0)]},
+        }
+        out = self._capture_latest(loaded)
+        self.assertIn("a", out)
+        self.assertIn("b", out)
+
     # --- plotext dispatch tests ---
 
     def test_render_plot_plotext_returns_string(self):
