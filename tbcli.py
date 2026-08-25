@@ -294,6 +294,23 @@ def _run_created_time(run_dir: Path) -> float:
         return 0.0
 
 
+def limit_to_most_recent_runs(
+    runs: Sequence[Path], last_n: Optional[int]
+) -> List[Path]:
+    """Keep only the ``last_n`` most recently created runs.
+
+    Recency is measured by :func:`_run_created_time` (the timestamp embedded in
+    each event filename). Runs are returned in their original discovery order
+    so downstream index-based and pattern-based selection stays consistent.
+    ``last_n`` of ``None`` or ``<= 0`` disables the limit.
+    """
+    if not last_n or last_n <= 0 or last_n >= len(runs):
+        return list(runs)
+    ranked = sorted(runs, key=_run_created_time, reverse=True)
+    kept = set(ranked[:last_n])
+    return [r for r in runs if r in kept]
+
+
 def load_scalars_fast(
     runs: Sequence[Path],
     stride: int = 10,
@@ -660,8 +677,24 @@ class TBRequestHandler:
 
     def _send_json(self, obj: object) -> None:
         import json
+        import math
 
-        body = json.dumps(obj).encode("utf-8")
+        # json.dumps emits bare ``NaN``/``Infinity`` tokens by default
+        # (allow_nan=True), which are invalid JSON and make every browser's
+        # strict JSON.parse reject the whole response — surfacing in Safari as
+        # "The string did not match the expected pattern". Metrics like
+        # pearson_r can legitimately contain NaN for undefined steps, so map
+        # any non-finite float to null (Plotly renders it as a gap).
+        def _clean(o: object) -> object:
+            if isinstance(o, float):
+                return o if math.isfinite(o) else None
+            if isinstance(o, dict):
+                return {k: _clean(v) for k, v in o.items()}
+            if isinstance(o, (list, tuple)):
+                return [_clean(v) for v in o]
+            return o
+
+        body = json.dumps(_clean(obj)).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -729,6 +762,8 @@ def run_web_server(args: "argparse.Namespace", logdir: Path) -> int:
     if not all_run_paths:
         print(f"No TensorBoard runs found in {logdir}", file=sys.stderr)
         return 1
+
+    all_run_paths = limit_to_most_recent_runs(all_run_paths, args.last)
 
     if args.runs:
         all_run_paths = filter_runs_by_patterns(all_run_paths, args.runs)
@@ -818,6 +853,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
              "against run name or path, or 'all'/'*' for every run. Tokens of "
              "different kinds may be mixed (e.g. '1,3,*exp*'). Only matching "
              "runs are loaded (speeds up startup on large log directories).",
+    )
+    parser.add_argument(
+        "--last",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Load only the N most recent runs (by event-file creation "
+             "time). 0 or negative means no limit. Applied to both --web and "
+             "CLI/TUI mode, before --runs selection, to speed up loading on "
+             "large log directories (default: 0, no limit).",
     )
     parser.add_argument("--metric", help="Metric tag to preselect")
     parser.add_argument("--refresh", type=float, default=5.0, help="Auto-refresh interval seconds")
@@ -940,6 +985,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return run_web_server(args, logdir)
 
     all_runs = discover_runs(logdir)
+    all_runs = limit_to_most_recent_runs(all_runs, args.last)
     try:
         selected_runs = _resolve_selected_runs(all_runs, args.runs)
         if args.fast_load:

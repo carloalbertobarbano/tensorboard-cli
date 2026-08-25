@@ -43,6 +43,34 @@ class TbCliTests(unittest.TestCase):
             runs = tbcli.discover_runs(Path("/logs"))
             self.assertEqual(runs, [Path("/logs/a"), Path("/logs/b")])
 
+    def _make_run_with_timestamp(self, tmp: Path, name: str, stamp: int) -> Path:
+        run_dir = tmp / name
+        run_dir.mkdir(parents=True)
+        (run_dir / f"events.out.tfevents.{stamp}.host").write_bytes(b"")
+        return run_dir
+
+    def test_limit_to_most_recent_runs_keeps_n_newest(self):
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            oldest = self._make_run_with_timestamp(tmp, "a", 1000)
+            mid = self._make_run_with_timestamp(tmp, "b", 2000)
+            newest = self._make_run_with_timestamp(tmp, "c", 3000)
+            kept = tbcli.limit_to_most_recent_runs([oldest, mid, newest], 2)
+            # discovery order preserved, only the 2 newest kept
+            self.assertEqual(kept, [mid, newest])
+
+    def test_limit_to_most_recent_runs_no_limit(self):
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            a = self._make_run_with_timestamp(tmp, "a", 1000)
+            b = self._make_run_with_timestamp(tmp, "b", 2000)
+            runs = [a, b]
+            self.assertEqual(tbcli.limit_to_most_recent_runs(runs, 0), runs)
+            self.assertEqual(tbcli.limit_to_most_recent_runs(runs, None), runs)
+            self.assertEqual(tbcli.limit_to_most_recent_runs(runs, -1), runs)
+            # N >= len keeps all
+            self.assertEqual(tbcli.limit_to_most_recent_runs(runs, 5), runs)
+
     def test_parse_selection(self):
         self.assertEqual(tbcli.parse_selection("1,3", 3), [0, 2])
         self.assertEqual(tbcli.parse_selection("all", 3), [0, 1, 2])
@@ -528,6 +556,53 @@ class FastLoadTests(unittest.TestCase):
             pass  # empty file
         data = tbcli.load_scalars_fast([Path(td)], stride=10, tail=500)
         self.assertEqual(data[str(Path(td))], {})
+
+    def test_send_json_sanitizes_non_finite_floats(self):
+        # Metrics like pearson_r can contain NaN/Infinity for undefined
+        # steps. json.dumps emits bare ``NaN``/``Infinity`` tokens by default,
+        # which are invalid JSON and make the browser's strict JSON.parse
+        # reject the whole response. _send_json must map them to null.
+        import json
+
+        class _FakeWFile:
+            def __init__(self):
+                self.buf = bytearray()
+            def write(self, b):
+                self.buf += b
+
+        class _FakeHandler:
+            def __init__(self):
+                self.wfile = _FakeWFile()
+            def send_response(self, code): pass
+            def send_header(self, k, v): pass
+            def end_headers(self): pass
+
+        fh = _FakeHandler()
+        payload = {
+            "metric": "eval/pc2/pearson_r",
+            "series": [{
+                "run": "a",
+                "points": [
+                    {"step": 1, "value": float("nan"), "wall_time": 1.0},
+                    {"step": 2, "value": float("inf"), "wall_time": 2.0},
+                    {"step": 3, "value": float("-inf"), "wall_time": 3.0},
+                    {"step": 4, "value": 0.5, "wall_time": 4.0},
+                ],
+            }],
+        }
+        tbcli.TBRequestHandler._send_json(fh, payload)
+        body = bytes(fh.wfile.buf)
+        self.assertNotIn(b"NaN", body)
+        self.assertNotIn(b"Infinity", body)
+        # strict parse must succeed, like a browser: reject bare NaN/Infinity
+        def _reject(const):
+            raise ValueError(f"bare JSON constant {const!r}")
+        decoded = json.loads(body.decode("utf-8"), parse_constant=_reject)
+        vals = decoded["series"][0]["points"]
+        self.assertIsNone(vals[0]["value"])
+        self.assertIsNone(vals[1]["value"])
+        self.assertIsNone(vals[2]["value"])
+        self.assertEqual(vals[3]["value"], 0.5)
 
 
 if __name__ == "__main__":
