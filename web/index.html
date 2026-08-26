@@ -62,6 +62,38 @@
   button:hover { border-color: var(--accent); color: var(--accent); }
   #refresh-btn { padding: 4px 12px; }
 
+  /* ── Metric multi-select dropdown ── */
+  .metric-dropdown { position: relative; }
+  #metric-btn {
+    display: flex; align-items: center; gap: 6px;
+    min-width: 160px; justify-content: space-between;
+  }
+  #metric-btn-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .popover {
+    position: absolute; top: calc(100% + 4px); left: 0;
+    width: 260px; max-height: 320px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 4px;
+    display: flex; flex-direction: column; z-index: 20;
+    box-shadow: 0 6px 20px rgba(0,0,0,0.4);
+  }
+  .popover.hidden { display: none; }
+  #metric-filter {
+    margin: 8px; padding: 4px 8px;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+    color: var(--text); font-size: 12px; outline: none;
+  }
+  #metric-filter:focus { border-color: var(--accent); }
+  #metric-list { overflow-y: auto; flex: 1; padding: 0 0 4px; }
+  .metric-item {
+    display: flex; align-items: center; gap: 8px;
+    padding: 4px 12px; cursor: pointer; transition: background 0.1s;
+  }
+  .metric-item:hover { background: var(--border); }
+  .metric-item input[type=checkbox] { accent-color: var(--accent); cursor: pointer; }
+  .metric-item .metric-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; font-size: 12px; }
+  .metric-actions { display: flex; gap: 6px; padding: 6px 8px 8px; border-top: 1px solid var(--border); }
+  .metric-actions button { flex: 1; font-size: 11px; padding: 3px 8px; }
+
   /* ── Body layout ── */
   #body {
     position: fixed;
@@ -165,8 +197,20 @@
 </div>
 
 <div id="toolbar">
-  <label for="metric-sel">Metric</label>
-  <select id="metric-sel" onchange="onMetricChange()"></select>
+  <label>Metric</label>
+  <div class="metric-dropdown">
+    <button id="metric-btn" type="button" onclick="toggleMetricDropdown()">
+      <span id="metric-btn-label">—</span><span>▾</span>
+    </button>
+    <div id="metric-popover" class="popover hidden">
+      <input type="text" id="metric-filter" placeholder="Filter metrics…" autocomplete="off" spellcheck="false">
+      <div id="metric-list"></div>
+      <div class="metric-actions">
+        <button onclick="selectAllMetrics()">All</button>
+        <button onclick="selectNoMetrics()">None</button>
+      </div>
+    </div>
+  </div>
   <label for="refresh-sel">Refresh</label>
   <select id="refresh-sel" onchange="onRefreshChange()">
     <option value="0">off</option>
@@ -220,7 +264,7 @@ const state = {
   allRuns: [],          // [{id, name, color}]
   selectedRuns: new Set(),
   allMetrics: [],
-  selectedMetric: null,
+  selectedMetrics: [],  // ordered list of metric tags currently plotted
   sortBy: 'name',
   runLimit: 0,          // 0 = all, otherwise last N runs by creation time
   refreshInterval: __REFRESH_DEFAULT__,
@@ -228,6 +272,84 @@ const state = {
   _fetching: false,
   _lastData: null,
 };
+
+function getMetricFilter() {
+  const raw = document.getElementById('metric-filter').value;
+  let regex = null;
+  try { regex = raw ? new RegExp(raw, 'i') : null; } catch { /* invalid */ }
+  return regex;
+}
+
+function buildMetricList() {
+  const el = document.getElementById('metric-list');
+  el.innerHTML = '';
+  const regex = getMetricFilter();
+  const metrics = regex ? state.allMetrics.filter(m => regex.test(m)) : [...state.allMetrics];
+  metrics.forEach(m => {
+    const item = document.createElement('div');
+    item.className = 'metric-item';
+    const checked = state.selectedMetrics.includes(m);
+    item.innerHTML = `
+      <input type="checkbox" ${checked ? 'checked' : ''}>
+      <span class="metric-name" title="${m}">${m}</span>
+    `;
+    item.querySelector('input').addEventListener('change', e => {
+      if (e.target.checked) {
+        if (!state.selectedMetrics.includes(m)) state.selectedMetrics.push(m);
+      } else {
+        state.selectedMetrics = state.selectedMetrics.filter(x => x !== m);
+      }
+      updateMetricButtonLabel();
+      refresh();
+    });
+    // Clicking the row toggles the checkbox too.
+    item.addEventListener('click', e => {
+      if (e.target === item || e.target.classList.contains('metric-name')) {
+        const cb = item.querySelector('input');
+        cb.checked = !cb.checked;
+        cb.dispatchEvent(new Event('change'));
+      }
+    });
+    el.appendChild(item);
+  });
+}
+
+function updateMetricButtonLabel() {
+  const label = document.getElementById('metric-btn-label');
+  const n = state.selectedMetrics.length;
+  if (n === 0) label.textContent = '(none)';
+  else if (n === 1) label.textContent = state.selectedMetrics[0];
+  else label.textContent = `${n} metrics`;
+}
+
+function toggleMetricDropdown() {
+  document.getElementById('metric-popover').classList.toggle('hidden');
+}
+
+function closeMetricDropdown() {
+  document.getElementById('metric-popover').classList.add('hidden');
+}
+
+function selectAllMetrics() {
+  const regex = getMetricFilter();
+  const metrics = regex ? state.allMetrics.filter(m => regex.test(m)) : [...state.allMetrics];
+  metrics.forEach(m => { if (!state.selectedMetrics.includes(m)) state.selectedMetrics.push(m); });
+  buildMetricList();
+  updateMetricButtonLabel();
+  refresh();
+}
+
+function selectNoMetrics() {
+  const regex = getMetricFilter();
+  if (regex) {
+    state.selectedMetrics = state.selectedMetrics.filter(m => !regex.test(m));
+  } else {
+    state.selectedMetrics = [];
+  }
+  buildMetricList();
+  updateMetricButtonLabel();
+  refresh();
+}
 
 function getVisibleRuns() {
   const filterEl = document.getElementById('run-filter');
@@ -278,18 +400,6 @@ function buildRunList() {
   });
 }
 
-function buildMetricDropdown() {
-  const sel = document.getElementById('metric-sel');
-  sel.innerHTML = '';
-  state.allMetrics.forEach(m => {
-    const opt = document.createElement('option');
-    opt.value = m;
-    opt.textContent = m;
-    if (m === state.selectedMetric) opt.selected = true;
-    sel.appendChild(opt);
-  });
-}
-
 function syncRefreshDropdown() {
   const sel = document.getElementById('refresh-sel');
   const val = String(state.refreshInterval);
@@ -304,11 +414,6 @@ function syncLimitDropdown() {
   for (const opt of sel.options) {
     if (opt.value === val) { opt.selected = true; break; }
   }
-}
-
-function onMetricChange() {
-  state.selectedMetric = document.getElementById('metric-sel').value;
-  refresh();
 }
 
 function onSortChange() {
@@ -352,10 +457,16 @@ async function refresh() {
 }
 
 async function _doRefresh() {
-  if (!state.selectedMetric) return;
+  if (state.selectedMetrics.length === 0) {
+    document.getElementById('chart').style.display = 'none';
+    document.getElementById('no-data').style.display = 'flex';
+    state._lastData = null;
+    return;
+  }
   const visibleIds = new Set(getVisibleRuns().map(r => r.id));
   const runs = [...state.selectedRuns].filter(id => visibleIds.has(id)).join(',');
-  const url = `/api/data?metric=${encodeURIComponent(state.selectedMetric)}&runs=${encodeURIComponent(runs)}`;
+  const metrics = state.selectedMetrics.map(encodeURIComponent).join(',');
+  const url = `/api/data?metrics=${metrics}&runs=${encodeURIComponent(runs)}`;
   const data = await fetch(url).then(r => {
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     return r.json();
@@ -376,40 +487,107 @@ function drawChart(data) {
   document.getElementById('no-data').style.display = hasSeries ? 'none' : 'flex';
   if (!hasSeries) return;
 
+  // Order metrics as the user selected them (fallback to server order).
+  const metricOrder = state.selectedMetrics.length ? state.selectedMetrics : (data.metrics || []);
+  const multiMetric = metricOrder.length > 1;
+
   // Legend follows trace order; sort series to match the sidebar sort.
   const createdMap = Object.fromEntries(state.allRuns.map(r => [r.id, r.created]));
   const traces = data.series
     .filter(s => s.points.length > 0)
-    .sort((a, b) => runComparator(
-      { name: a.run, created: createdMap[a.run_id] },
-      { name: b.run, created: createdMap[b.run_id] },
-    ))
-    .map(s => ({
-      x: s.points.map(p => p.step),
-      y: s.points.map(p => p.value),
-      name: (() => { const last = s.points[s.points.length - 1]; return `${s.run}  ${last.value.toPrecision(4)} @ step ${last.step}`; })(),
-      mode: 'lines',
-      line: { color: s.color, width: 2 },
-      hovertemplate: `<b>${s.run}</b><br>step=%{x}<br>${data.metric}=%{y:.4f}<extra></extra>`,
-    }));
+    .sort((a, b) => {
+      // Group by metric (in selected order) then by run sort.
+      const ma = metricOrder.indexOf(a.metric), mb = metricOrder.indexOf(b.metric);
+      if (ma !== mb) return ma - mb;
+      return runComparator(
+        { name: a.run, created: createdMap[a.run_id] },
+        { name: b.run, created: createdMap[b.run_id] },
+      );
+    })
+    .map(s => {
+      const last = s.points[s.points.length - 1];
+      const trace = {
+        x: s.points.map(p => p.step),
+        y: s.points.map(p => p.value),
+        mode: 'lines',
+        line: { color: s.color, width: 2 },
+        hovertemplate: `<b>${s.run}</b><br>step=%{x}<br>${s.metric}=%{y:.4f}<extra></extra>`,
+        name: `${s.run}  ${last.value.toPrecision(4)} @ step ${last.step}`,
+      };
+      if (multiMetric) {
+        // Each metric lives in its own subplot row; assign the trace to the
+        // matching x/y axis pair (x/y, x2/y2, …). legendgroup keeps a metric's
+        // runs together in the legend.
+        const mi = metricOrder.indexOf(s.metric);
+        trace.xaxis = mi === 0 ? 'x' : 'x' + (mi + 1);
+        trace.yaxis = mi === 0 ? 'y' : 'y' + (mi + 1);
+        trace.legendgroup = s.metric;
+      }
+      return trace;
+    });
 
   const n = traces.length;
   const legendFontSize = n <= 10 ? 12 : n <= 20 ? 11 : n <= 50 ? 10 : 9;
   // Horizontal legend: reserve more bottom margin as the run count grows.
   const bottomMargin = n <= 10 ? 90 : n <= 20 ? 110 : n <= 50 ? 140 : 180;
 
-  const layout = {
-    title: { text: data.metric, font: { color: '#cdd6f4', size: 14 } },
-    xaxis: { title: { text: 'step', font: { color: '#6c7086' } }, color: '#6c7086', gridcolor: '#3a3a5c', zerolinecolor: '#3a3a5c' },
-    yaxis: { title: { text: 'value', font: { color: '#6c7086' } }, color: '#6c7086', gridcolor: '#3a3a5c', zerolinecolor: '#3a3a5c' },
-    legend: { orientation: 'h', y: -0.22, font: { color: '#cdd6f4', size: legendFontSize } },
-    margin: { t: 50, r: 20, b: bottomMargin, l: 60 },
-    hovermode: 'x unified',
-    paper_bgcolor: '#1e1e2e',
-    plot_bgcolor: '#1e1e2e',
-    font: { color: '#cdd6f4' },
-    hoverlabel: { bgcolor: '#2a2a3e', bordercolor: '#3a3a5c', font: { color: '#cdd6f4' } },
-  };
+  const axisColor = '#6c7086';
+  const gridColor = '#3a3a5c';
+  const xStyle = { color: axisColor, gridcolor: gridColor, zerolinecolor: gridColor, title: { text: 'step', font: { color: axisColor } } };
+  const yStyle = { color: axisColor, gridcolor: gridColor, zerolinecolor: gridColor, title: { text: 'value', font: { color: axisColor } } };
+
+  let layout;
+  if (multiMetric) {
+    // One vertically stacked subplot per metric, sharing the x-axis. Only the
+    // bottom subplot shows the step axis (shared_xaxes), the rest stay compact.
+    // Built by hand: Plotly.js (unlike the Python plotly helper) has no
+    // makeSubplots. Stack one subplot per metric, sharing the x-axis range —
+    // only the bottom row shows the step axis, the rest hide their ticks.
+    const nrows = metricOrder.length;
+    const vSpace = Math.min(0.12, 0.5 / nrows);
+    const plotH = (1 - (nrows - 1) * vSpace) / nrows;
+    layout = { annotations: [] };
+    for (let i = 0; i < nrows; i++) {
+      const yTop = 1 - i * (plotH + vSpace);
+      const yBot = yTop - plotH;
+      const xName = i === 0 ? 'x' : 'x' + (i + 1);
+      const yName = i === 0 ? 'y' : 'y' + (i + 1);
+      const xk = 'xaxis' + (i === 0 ? '' : (i + 1));
+      const yk = 'yaxis' + (i === 0 ? '' : (i + 1));
+      const isBottom = i === nrows - 1;
+      layout[yk] = Object.assign({ domain: [yBot, yTop], anchor: xName }, yStyle);
+      const xCfg = { domain: [0, 1], anchor: yName, color: axisColor, gridcolor: gridColor, zerolinecolor: gridColor };
+      if (i > 0) xCfg.matches = 'x';          // link range to the top subplot's x axis
+      if (isBottom) xCfg.title = { text: 'step', font: { color: axisColor } };
+      else xCfg.showticklabels = false;
+      layout[xk] = xCfg;
+      // subplot title sits just above its row
+      layout.annotations.push({
+        text: metricOrder[i], x: 0.5, xref: 'paper', y: yTop, yref: 'paper',
+        yanchor: 'bottom', font: { color: '#cdd6f4', size: 13 }, showarrow: false,
+      });
+    }
+    layout.legend = { orientation: 'h', y: -0.18, font: { color: '#cdd6f4', size: legendFontSize }, tracegroupgap: 8 };
+    layout.margin = { t: 50, r: 20, b: bottomMargin, l: 60 };
+    layout.hovermode = 'x unified';
+    layout.paper_bgcolor = '#1e1e2e';
+    layout.plot_bgcolor = '#1e1e2e';
+    layout.font = { color: '#cdd6f4' };
+    layout.hoverlabel = { bgcolor: '#2a2a3e', bordercolor: '#3a3a5c', font: { color: '#cdd6f4' } };
+  } else {
+    layout = {
+      title: { text: metricOrder.join(', '), font: { color: '#cdd6f4', size: 14 } },
+      xaxis: xStyle,
+      yaxis: yStyle,
+      legend: { orientation: 'h', y: -0.22, font: { color: '#cdd6f4', size: legendFontSize }, tracegroupgap: 8 },
+      margin: { t: 50, r: 20, b: bottomMargin, l: 60 },
+      hovermode: 'x unified',
+      paper_bgcolor: '#1e1e2e',
+      plot_bgcolor: '#1e1e2e',
+      font: { color: '#cdd6f4' },
+      hoverlabel: { bgcolor: '#2a2a3e', bordercolor: '#3a3a5c', font: { color: '#cdd6f4' } },
+    };
+  }
 
   Plotly.react('chart', traces, layout, { responsive: true, displaylogo: false });
 }
@@ -465,12 +643,22 @@ document.addEventListener('DOMContentLoaded', async () => {
   info.runs.forEach((r, i) => { r.color = PALETTE[i % PALETTE.length]; });
   state.allRuns = info.runs;
   state.allMetrics = info.metrics;
-  state.selectedMetric = info.metrics[0] ?? null;
+  state.selectedMetrics = info.metrics.slice(0, 1);  // default: first metric (today's behavior)
   state.selectedRuns = new Set(info.runs.map(r => r.id));
 
   document.getElementById('run-filter').addEventListener('input', () => { buildRunList(); refresh(); });
+  document.getElementById('metric-filter').addEventListener('input', () => { buildMetricList(); });
+  // Close the metric popover on outside clicks.
+  document.addEventListener('click', e => {
+    const pop = document.getElementById('metric-popover');
+    if (pop.classList.contains('hidden')) return;
+    if (!pop.contains(e.target) && e.target.id !== 'metric-btn' && !document.getElementById('metric-btn').contains(e.target)) {
+      closeMetricDropdown();
+    }
+  });
   buildRunList();
-  buildMetricDropdown();
+  buildMetricList();
+  updateMetricButtonLabel();
   syncRefreshDropdown();
   syncLimitDropdown();
   overlay.classList.add('hidden');

@@ -726,7 +726,21 @@ class TBRequestHandler:
         requested = [r for r in all_run_paths if str(r) in run_id_set]
 
         all_metrics: List[str] = state.get("all_metrics", [])
-        metric = params.get("metric", [None])[0] or (all_metrics[0] if all_metrics else None)
+        # Accept multiple metrics via the comma-separated `metrics` param. The
+        # single `metric` param stays as a backward-compatible fallback (one
+        # metric) so old URLs/bookmarks keep working.
+        metrics_raw = params.get("metrics", [None])[0]
+        if metrics_raw:
+            requested_metrics: List[str] = []
+            for m in metrics_raw.split(","):
+                m = m.strip()
+                if m and m not in requested_metrics:
+                    requested_metrics.append(m)
+        else:
+            single = params.get("metric", [None])[0]
+            requested_metrics = [single] if single else (
+                [all_metrics[0]] if all_metrics else []
+            )
 
         # Read from the shared cache populated by the background reload thread
         data_lock = state.get("data_lock")
@@ -735,19 +749,21 @@ class TBRequestHandler:
             loaded = {str(r): cached.get(str(r), {}) for r in requested}
 
         series = []
-        for run_path in requested:
-            run_key = str(run_path)
-            palette_idx = all_run_paths.index(run_path) % len(_PALETTE_RGB)
-            r, g, b = _PALETTE_RGB[palette_idx]
-            points = loaded.get(run_key, {}).get(metric, []) if metric else []
-            series.append({
-                "run": run_path.name,
-                "run_id": run_key,
-                "color": f"rgb({r},{g},{b})",
-                "points": [{"step": p.step, "value": p.value, "wall_time": p.wall_time} for p in points],
-            })
+        for metric in requested_metrics:
+            for run_path in requested:
+                run_key = str(run_path)
+                palette_idx = all_run_paths.index(run_path) % len(_PALETTE_RGB)
+                r, g, b = _PALETTE_RGB[palette_idx]
+                points = loaded.get(run_key, {}).get(metric, []) if metric else []
+                series.append({
+                    "run": run_path.name,
+                    "run_id": run_key,
+                    "color": f"rgb({r},{g},{b})",
+                    "metric": metric,
+                    "points": [{"step": p.step, "value": p.value, "wall_time": p.wall_time} for p in points],
+                })
 
-        self._send_json({"metric": metric, "series": series})
+        self._send_json({"metrics": requested_metrics, "series": series})
 
     def log_message(self, fmt: str, *args: object) -> None:
         pass  # suppress per-request access log
