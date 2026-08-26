@@ -493,6 +493,7 @@ function drawChart(data) {
 
   // Legend follows trace order; sort series to match the sidebar sort.
   const createdMap = Object.fromEntries(state.allRuns.map(r => [r.id, r.created]));
+  const seenRuns = new Set();
   const traces = data.series
     .filter(s => s.points.length > 0)
     .sort((a, b) => {
@@ -506,25 +507,45 @@ function drawChart(data) {
     })
     .map(s => {
       const last = s.points[s.points.length - 1];
+      const p = metricOrder.indexOf(s.metric);
+      const isFirstForRun = !seenRuns.has(s.run);
+      seenRuns.add(s.run);
       const trace = {
-        x: s.points.map(p => p.step),
-        y: s.points.map(p => p.value),
+        x: s.points.map(pt => pt.step),
+        y: s.points.map(pt => pt.value),
         mode: 'lines',
         line: { color: s.color, width: 2 },
         hovertemplate: `<b>${s.run}</b><br>step=%{x}<br>${s.metric}=%{y:.4f}<extra></extra>`,
-        name: `${s.run}  ${last.value.toPrecision(4)} @ step ${last.step}`,
+        // Single metric: show the inline last value the user is used to.
+        // Multiple metrics: a run spans several panels, so the legend lists
+        // each run once (the value lives in the hover) — see legendgroup below.
+        name: multiMetric ? s.run : `${s.run}  ${last.value.toPrecision(4)} @ step ${last.step}`,
+        showlegend: multiMetric ? isFirstForRun : true,
       };
       if (multiMetric) {
-        // Each metric lives in its own subplot row; assign the trace to the
-        // matching x/y axis pair (x/y, x2/y2, …). legendgroup keeps a metric's
-        // runs together in the legend.
-        const mi = metricOrder.indexOf(s.metric);
-        trace.xaxis = mi === 0 ? 'x' : 'x' + (mi + 1);
-        trace.yaxis = mi === 0 ? 'y' : 'y' + (mi + 1);
-        trace.legendgroup = s.metric;
+        // Each metric gets its own subplot; assign the trace to that panel's
+        // x/y axis pair (x/y, x2/y2, …). legendgroup per run collapses all of
+        // a run's panels into one legend entry (clicking it toggles the run).
+        trace.xaxis = p === 0 ? 'x' : 'x' + (p + 1);
+        trace.yaxis = p === 0 ? 'y' : 'y' + (p + 1);
+        trace.legendgroup = s.run;
       }
       return trace;
     });
+
+  // Append the selected metrics as a final legend group, so the single legend
+  // also serves as a checklist of which metrics are shown (gray, no data).
+  if (multiMetric) {
+    metricOrder.forEach(m => {
+      traces.push({
+        x: [], y: [], mode: 'lines',
+        line: { color: '#585b70', width: 2 },
+        name: m, showlegend: true, hoverinfo: 'skip',
+        legendgroup: 'metrics',
+        legendgrouptitle: { text: 'Metrics', font: { color: '#cdd6f4' } },
+      });
+    });
+  }
 
   const n = traces.length;
   const legendFontSize = n <= 10 ? 12 : n <= 20 ? 11 : n <= 50 ? 10 : 9;
@@ -538,36 +559,55 @@ function drawChart(data) {
 
   let layout;
   if (multiMetric) {
-    // One vertically stacked subplot per metric, sharing the x-axis. Only the
-    // bottom subplot shows the step axis (shared_xaxes), the rest stay compact.
-    // Built by hand: Plotly.js (unlike the Python plotly helper) has no
-    // makeSubplots. Stack one subplot per metric, sharing the x-axis range —
-    // only the bottom row shows the step axis, the rest hide their ticks.
-    const nrows = metricOrder.length;
-    const vSpace = Math.min(0.12, 0.5 / nrows);
+    // Grid of subplots (near-square), one per metric, so panels stay readable
+    // as the metric count grows. Each panel has its own y axis; x axes within a
+    // column share their range (matches) and only each column's bottom panel
+    // shows the step axis. Built by hand — Plotly.js has no makeSubplots.
+    const nmetrics = metricOrder.length;
+    const ncols = Math.ceil(Math.sqrt(nmetrics));
+    const nrows = Math.ceil(nmetrics / ncols);
+    const vSpace = Math.min(0.10, 0.5 / nrows);
+    const hSpace = Math.min(0.06, 0.3 / ncols);
     const plotH = (1 - (nrows - 1) * vSpace) / nrows;
+    const plotW = (1 - (ncols - 1) * hSpace) / ncols;
+    const xDom = c => { const l = c * (plotW + hSpace); return [l, l + plotW]; };
+    const yDom = r => { const t = 1 - r * (plotH + vSpace); return [t - plotH, t]; };
+    // lowest panel index in a column (the one that shows the step axis)
+    const colBottomPanel = c => { let r = nrows - 1; while (r * ncols + c >= nmetrics) r--; return r * ncols + c; };
+
     layout = { annotations: [] };
-    for (let i = 0; i < nrows; i++) {
-      const yTop = 1 - i * (plotH + vSpace);
-      const yBot = yTop - plotH;
-      const xName = i === 0 ? 'x' : 'x' + (i + 1);
-      const yName = i === 0 ? 'y' : 'y' + (i + 1);
-      const xk = 'xaxis' + (i === 0 ? '' : (i + 1));
-      const yk = 'yaxis' + (i === 0 ? '' : (i + 1));
-      const isBottom = i === nrows - 1;
-      layout[yk] = Object.assign({ domain: [yBot, yTop], anchor: xName }, yStyle);
-      const xCfg = { domain: [0, 1], anchor: yName, color: axisColor, gridcolor: gridColor, zerolinecolor: gridColor };
-      if (i > 0) xCfg.matches = 'x';          // link range to the top subplot's x axis
-      if (isBottom) xCfg.title = { text: 'step', font: { color: axisColor } };
-      else xCfg.showticklabels = false;
+    for (let p = 0; p < nmetrics; p++) {
+      const row = Math.floor(p / ncols);
+      const col = p % ncols;
+      const [xL, xR] = xDom(col);
+      const [yB, yT] = yDom(row);
+      const xName = p === 0 ? 'x' : 'x' + (p + 1);
+      const yName = p === 0 ? 'y' : 'y' + (p + 1);
+      const xk = 'xaxis' + (p === 0 ? '' : (p + 1));
+      const yk = 'yaxis' + (p === 0 ? '' : (p + 1));
+      const isColBottom = row === nrows - 1 || (row + 1) * ncols + col >= nmetrics;
+
+      const yCfg = { domain: [yB, yT], anchor: xName, color: axisColor, gridcolor: gridColor, zerolinecolor: gridColor };
+      if (col === 0) yCfg.title = { text: 'value', font: { color: axisColor } };  // label the y axis once per row
+      layout[yk] = yCfg;
+
+      const xCfg = { domain: [xL, xR], anchor: yName, color: axisColor, gridcolor: gridColor, zerolinecolor: gridColor };
+      if (isColBottom) {
+        xCfg.title = { text: 'step', font: { color: axisColor } };
+      } else {
+        xCfg.showticklabels = false;
+        const bp = colBottomPanel(col);
+        xCfg.matches = bp === 0 ? 'x' : 'x' + (bp + 1);  // link range to the column's bottom x axis
+      }
       layout[xk] = xCfg;
-      // subplot title sits just above its row
+
+      // subplot title sits just above its panel
       layout.annotations.push({
-        text: metricOrder[i], x: 0.5, xref: 'paper', y: yTop, yref: 'paper',
+        text: metricOrder[p], x: (xL + xR) / 2, xref: 'paper', y: yT, yref: 'paper',
         yanchor: 'bottom', font: { color: '#cdd6f4', size: 13 }, showarrow: false,
       });
     }
-    layout.legend = { orientation: 'h', y: -0.18, font: { color: '#cdd6f4', size: legendFontSize }, tracegroupgap: 8 };
+    layout.legend = { orientation: 'h', y: -0.18, font: { color: '#cdd6f4', size: legendFontSize }, tracegroupgap: 6 };
     layout.margin = { t: 50, r: 20, b: bottomMargin, l: 60 };
     layout.hovermode = 'x unified';
     layout.paper_bgcolor = '#1e1e2e';
