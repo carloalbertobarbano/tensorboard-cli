@@ -494,6 +494,15 @@ function drawChart(data) {
   // Legend follows trace order; sort series to match the sidebar sort.
   const createdMap = Object.fromEntries(state.allRuns.map(r => [r.id, r.created]));
   const seenRuns = new Set();
+  // Last value/step of every selected metric for each run — used to build the
+  // inline "metric=value @ step ..." legend entry shown once per run.
+  const lastByRun = new Map();
+  data.series.forEach(s => {
+    if (!s.points.length) return;
+    if (!lastByRun.has(s.run)) lastByRun.set(s.run, {});
+    const lp = s.points[s.points.length - 1];
+    lastByRun.get(s.run)[s.metric] = { value: lp.value, step: lp.step };
+  });
   const traces = data.series
     .filter(s => s.points.length > 0)
     .sort((a, b) => {
@@ -510,16 +519,28 @@ function drawChart(data) {
       const p = metricOrder.indexOf(s.metric);
       const isFirstForRun = !seenRuns.has(s.run);
       seenRuns.add(s.run);
+      // One legend entry per run. On that entry, append the last value/step of
+      // every selected metric that has data for the run; non-shown traces just
+      // carry the run name (their name is not rendered in the legend).
+      let name;
+      if (multiMetric && isFirstForRun) {
+        const lv = lastByRun.get(s.run) || {};
+        const parts = metricOrder
+          .filter(m => lv[m])
+          .map(m => `${m}=${lv[m].value.toPrecision(4)} @ step ${lv[m].step}`);
+        name = parts.length ? `${s.run}  ${parts.join('  ')}` : s.run;
+      } else if (multiMetric) {
+        name = s.run;
+      } else {
+        name = `${s.run}  ${last.value.toPrecision(4)} @ step ${last.step}`;
+      }
       const trace = {
         x: s.points.map(pt => pt.step),
         y: s.points.map(pt => pt.value),
         mode: 'lines',
         line: { color: s.color, width: 2 },
         hovertemplate: `<b>${s.run}</b><br>step=%{x}<br>${s.metric}=%{y:.4f}<extra></extra>`,
-        // Single metric: show the inline last value the user is used to.
-        // Multiple metrics: a run spans several panels, so the legend lists
-        // each run once (the value lives in the hover) — see legendgroup below.
-        name: multiMetric ? s.run : `${s.run}  ${last.value.toPrecision(4)} @ step ${last.step}`,
+        name,
         showlegend: multiMetric ? isFirstForRun : true,
       };
       if (multiMetric) {
