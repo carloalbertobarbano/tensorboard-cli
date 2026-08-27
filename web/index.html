@@ -325,7 +325,37 @@ const state = {
   _timer: null,
   _fetching: false,
   _lastData: null,
+  _storageKey: 'tbcli.workspace',  // scoped per-logdir once /api/runs returns
 };
+
+// Persist the workspace (selected metrics/runs, sort, limits, filters, hidden
+// runs) to localStorage so it survives reloads. Scoped per logdir so selections
+// from one experiment don't bleed into another. All access is wrapped in
+// try/catch: localStorage can be unavailable (private browsing, blocked site
+// storage) — we silently degrade to no persistence in that case.
+function storageKey() { return state._storageKey || 'tbcli.workspace'; }
+
+function saveWorkspace() {
+  try {
+    localStorage.setItem(storageKey(), JSON.stringify({
+      v: 1,
+      selectedMetrics: state.selectedMetrics,
+      selectedRuns: [...state.selectedRuns],
+      hiddenRuns: [...state.hiddenRuns],
+      sortBy: state.sortBy,
+      runLimit: state.runLimit,
+      refreshInterval: state.refreshInterval,
+      runFilter: document.getElementById('run-filter').value,
+    }));
+  } catch { /* storage unavailable or full */ }
+}
+
+function loadWorkspace() {
+  try {
+    const raw = localStorage.getItem(storageKey());
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
 
 function getMetricFilter() {
   const raw = document.getElementById('metric-filter').value;
@@ -354,6 +384,7 @@ function buildMetricList() {
         state.selectedMetrics = state.selectedMetrics.filter(x => x !== m);
       }
       updateMetricButtonLabel();
+      saveWorkspace();
       refresh();
     });
     // Clicking the row toggles the checkbox too.
@@ -390,6 +421,7 @@ function selectAllMetrics() {
   metrics.forEach(m => { if (!state.selectedMetrics.includes(m)) state.selectedMetrics.push(m); });
   buildMetricList();
   updateMetricButtonLabel();
+  saveWorkspace();
   refresh();
 }
 
@@ -402,6 +434,7 @@ function selectNoMetrics() {
   }
   buildMetricList();
   updateMetricButtonLabel();
+  saveWorkspace();
   refresh();
 }
 
@@ -448,6 +481,7 @@ function buildRunList() {
     item.querySelector('input').addEventListener('change', e => {
       if (e.target.checked) state.selectedRuns.add(run.id);
       else state.selectedRuns.delete(run.id);
+      saveWorkspace();
       refresh();
     });
     el.appendChild(item);
@@ -470,8 +504,16 @@ function syncLimitDropdown() {
   }
 }
 
+function syncSortDropdown() {
+  const sel = document.getElementById('sort-sel');
+  for (const opt of sel.options) {
+    if (opt.value === state.sortBy) { opt.selected = true; break; }
+  }
+}
+
 function onSortChange() {
   state.sortBy = document.getElementById('sort-sel').value;
+  saveWorkspace();
   buildRunList();
   // Reorder the legend without refetching; fall back to a fetch if no data yet.
   if (state._lastData) drawChart(state._lastData);
@@ -480,12 +522,14 @@ function onSortChange() {
 
 function onRefreshChange() {
   state.refreshInterval = Number(document.getElementById('refresh-sel').value);
+  saveWorkspace();
   scheduleAutoRefresh();
 }
 
 function onLimitChange() {
   const val = Number(document.getElementById('limit-sel').value);
   state.runLimit = val === 0 ? 0 : val;
+  saveWorkspace();
   buildRunList();
   refresh();
 }
@@ -719,6 +763,7 @@ function renderLegend(items) {
     chip.onclick = () => {
       if (state.hiddenRuns.has(it.run)) state.hiddenRuns.delete(it.run);
       else state.hiddenRuns.add(it.run);
+      saveWorkspace();
       drawChart(state._lastData);
     };
     el.appendChild(chip);
@@ -767,12 +812,14 @@ function setErr(msg) {
 function selectAll() {
   getVisibleRuns().forEach(r => state.selectedRuns.add(r.id));
   buildRunList();
+  saveWorkspace();
   refresh();
 }
 
 function selectNone() {
   getVisibleRuns().forEach(r => state.selectedRuns.delete(r.id));
   buildRunList();
+  saveWorkspace();
   refresh();
 }
 
@@ -805,10 +852,34 @@ document.addEventListener('DOMContentLoaded', async () => {
   info.runs.forEach((r, i) => { r.color = PALETTE[i % PALETTE.length]; });
   state.allRuns = info.runs;
   state.allMetrics = info.metrics;
-  state.selectedMetrics = info.metrics.slice(0, 1);  // default: first metric (today's behavior)
-  state.selectedRuns = new Set(info.runs.map(r => r.id));
 
-  document.getElementById('run-filter').addEventListener('input', () => { buildRunList(); refresh(); });
+  // Restore the persisted workspace for this logdir. Metrics/runs that no
+  // longer exist are dropped (order preserved); if nothing usable survives we
+  // fall back to today's defaults (first metric, all runs).
+  state._storageKey = (info.logdir ? 'tbcli.workspace:' + info.logdir : 'tbcli.workspace');
+  const ws = loadWorkspace();
+  const knownMetrics = new Set(state.allMetrics);
+  if (ws && Array.isArray(ws.selectedMetrics)) {
+    state.selectedMetrics = ws.selectedMetrics.filter(m => knownMetrics.has(m));
+  }
+  if (!state.selectedMetrics.length) state.selectedMetrics = state.allMetrics.slice(0, 1);
+
+  const knownRunIds = new Set(state.allRuns.map(r => r.id));
+  if (ws && Array.isArray(ws.selectedRuns)) {
+    state.selectedRuns = new Set(ws.selectedRuns.filter(id => knownRunIds.has(id)));
+  } else {
+    state.selectedRuns = new Set(state.allRuns.map(r => r.id));
+  }
+
+  if (ws) {
+    if (ws.sortBy) state.sortBy = ws.sortBy;
+    if (typeof ws.runLimit === 'number') state.runLimit = ws.runLimit;
+    if (typeof ws.refreshInterval === 'number') state.refreshInterval = ws.refreshInterval;
+    if (Array.isArray(ws.hiddenRuns)) state.hiddenRuns = new Set(ws.hiddenRuns);
+    if (typeof ws.runFilter === 'string') document.getElementById('run-filter').value = ws.runFilter;
+  }
+
+  document.getElementById('run-filter').addEventListener('input', () => { saveWorkspace(); buildRunList(); refresh(); });
   document.getElementById('metric-filter').addEventListener('input', () => { buildMetricList(); });
   // Close the metric popover on outside clicks.
   document.addEventListener('click', e => {
@@ -823,6 +894,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   updateMetricButtonLabel();
   syncRefreshDropdown();
   syncLimitDropdown();
+  syncSortDropdown();
   overlay.classList.add('hidden');
   await refresh();
   scheduleAutoRefresh();

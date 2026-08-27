@@ -747,7 +747,11 @@ class TBRequestHandler:
             {"id": str(r), "name": r.name, "created": _run_created_time(r)}
             for r in all_runs
         ]
-        self._send_json({"runs": runs_payload, "metrics": state.get("all_metrics", [])})
+        self._send_json({
+            "runs": runs_payload,
+            "metrics": state.get("all_metrics", []),
+            "logdir": state.get("logdir", ""),
+        })
 
     def _api_data(self, params: dict) -> None:
         import json
@@ -848,6 +852,7 @@ def run_web_server(args: "argparse.Namespace", logdir: Path) -> int:
         "all_run_paths": all_run_paths,
         "loader": loader,
         "args": args,
+        "logdir": str(logdir),
         "all_metrics": [],
         "cached_data": {},
         "metrics_ready": metrics_ready,
