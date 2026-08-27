@@ -146,8 +146,43 @@
 
   /* ── Chart area ── */
   #chart-wrap { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
-  #chart { flex: 1; }
+  #chart { flex: 1; min-height: 0; }
   #no-data { display: none; flex: 1; align-items: center; justify-content: center; color: var(--text-dim); font-size: 14px; }
+
+  /* ── HTML legend (wraps long per-run inline entries) ── */
+  #legend {
+    flex: 0 0 auto;
+    max-height: 34%;
+    overflow-y: auto;
+    padding: 4px 10px;
+    border-top: 1px solid var(--border);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 10px;
+    font-size: 11px;
+    line-height: 1.35;
+    color: var(--text);
+  }
+  .leg-item {
+    display: inline-flex;
+    align-items: flex-start;
+    gap: 5px;
+    max-width: 100%;
+    cursor: pointer;
+    padding: 1px 3px;
+    border-radius: 3px;
+    white-space: normal;
+    word-break: break-word;
+  }
+  .leg-item:hover { background: var(--border); }
+  .leg-item .leg-sw {
+    flex: 0 0 auto;
+    width: 14px; height: 3px;
+    border-radius: 2px;
+    margin-top: 7px;
+  }
+  .leg-item.hidden { opacity: 0.4; text-decoration: line-through; }
+  .leg-metric { color: var(--text-dim); margin-left: 2px; }
 
   /* ── Status bar ── */
   #status {
@@ -249,6 +284,7 @@
   </div>
   <div id="chart-wrap">
     <div id="chart"></div>
+    <div id="legend"></div>
     <div id="no-data">No data to display</div>
   </div>
 </div>
@@ -267,6 +303,7 @@ const state = {
   selectedMetrics: [],  // ordered list of metric tags currently plotted
   sortBy: 'name',
   runLimit: 0,          // 0 = all, otherwise last N runs by creation time
+  hiddenRuns: new Set(),  // runs toggled off in the HTML legend
   refreshInterval: __REFRESH_DEFAULT__,
   _timer: null,
   _fetching: false,
@@ -485,6 +522,7 @@ function drawChart(data) {
   const hasSeries = data.series.some(s => s.points.length > 0);
   document.getElementById('chart').style.display = hasSeries ? 'block' : 'none';
   document.getElementById('no-data').style.display = hasSeries ? 'none' : 'flex';
+  document.getElementById('legend').style.display = hasSeries ? 'flex' : 'none';
   if (!hasSeries) return;
 
   // Order metrics as the user selected them (fallback to server order).
@@ -503,6 +541,8 @@ function drawChart(data) {
     const lp = s.points[s.points.length - 1];
     lastByRun.get(s.run)[s.metric] = { value: lp.value, step: lp.step };
   });
+  const hidden = state.hiddenRuns;
+  const legendItems = [];
   const traces = data.series
     .filter(s => s.points.length > 0)
     .sort((a, b) => {
@@ -519,20 +559,16 @@ function drawChart(data) {
       const p = metricOrder.indexOf(s.metric);
       const isFirstForRun = !seenRuns.has(s.run);
       seenRuns.add(s.run);
-      // One legend entry per run. On that entry, append the last value/step of
-      // every selected metric that has data for the run; non-shown traces just
-      // carry the run name (their name is not rendered in the legend).
-      let name;
-      if (multiMetric && isFirstForRun) {
+      // Collect one legend entry per run: the run name plus the last
+      // value/step of every selected metric that has data for the run. The
+      // legend is rendered as wrapping HTML below the chart (renderLegend),
+      // so Plotly's own legend is turned off in the layout below.
+      if (isFirstForRun) {
         const lv = lastByRun.get(s.run) || {};
         const parts = metricOrder
           .filter(m => lv[m])
-          .map(m => `${m}=${lv[m].value.toPrecision(4)} @ step ${lv[m].step}`);
-        name = parts.length ? `${s.run}  ${parts.join('  ')}` : s.run;
-      } else if (multiMetric) {
-        name = s.run;
-      } else {
-        name = `${s.run}  ${last.value.toPrecision(4)} @ step ${last.step}`;
+          .map(m => ({ metric: m, value: lv[m].value.toPrecision(4), step: lv[m].step }));
+        legendItems.push({ run: s.run, color: s.color, parts });
       }
       const trace = {
         x: s.points.map(pt => pt.step),
@@ -540,38 +576,17 @@ function drawChart(data) {
         mode: 'lines',
         line: { color: s.color, width: 2 },
         hovertemplate: `<b>${s.run}</b><br>step=%{x}<br>${s.metric}=%{y:.4f}<extra></extra>`,
-        name,
-        showlegend: multiMetric ? isFirstForRun : true,
+        name: s.run,
+        visible: hidden.has(s.run) ? false : true,
       };
       if (multiMetric) {
         // Each metric gets its own subplot; assign the trace to that panel's
-        // x/y axis pair (x/y, x2/y2, …). legendgroup per run collapses all of
-        // a run's panels into one legend entry (clicking it toggles the run).
+        // x/y axis pair (x/y, x2/y2, …).
         trace.xaxis = p === 0 ? 'x' : 'x' + (p + 1);
         trace.yaxis = p === 0 ? 'y' : 'y' + (p + 1);
-        trace.legendgroup = s.run;
       }
       return trace;
     });
-
-  // Append the selected metrics as a final legend group, so the single legend
-  // also serves as a checklist of which metrics are shown (gray, no data).
-  if (multiMetric) {
-    metricOrder.forEach(m => {
-      traces.push({
-        x: [], y: [], mode: 'lines',
-        line: { color: '#585b70', width: 2 },
-        name: m, showlegend: true, hoverinfo: 'skip',
-        legendgroup: 'metrics',
-        legendgrouptitle: { text: 'Metrics', font: { color: '#cdd6f4' } },
-      });
-    });
-  }
-
-  const n = traces.length;
-  const legendFontSize = n <= 10 ? 12 : n <= 20 ? 11 : n <= 50 ? 10 : 9;
-  // Horizontal legend: reserve more bottom margin as the run count grows.
-  const bottomMargin = n <= 10 ? 90 : n <= 20 ? 110 : n <= 50 ? 140 : 180;
 
   const axisColor = '#6c7086';
   const gridColor = '#3a3a5c';
@@ -581,22 +596,21 @@ function drawChart(data) {
   let layout;
   if (multiMetric) {
     // Grid of subplots (near-square), one per metric, so panels stay readable
-    // as the metric count grows. Each panel has its own y axis; x axes within a
-    // column share their range (matches) and only each column's bottom panel
-    // shows the step axis. Built by hand — Plotly.js has no makeSubplots.
+    // as the metric count grows. Every panel has INDEPENDENT x and y axes (its
+    // own step range and value scale); the 'step' label is printed only on the
+    // bottom panel of each column to avoid repetition. Built by hand — Plotly.js
+    // has no makeSubplots.
     const nmetrics = metricOrder.length;
     const ncols = Math.ceil(Math.sqrt(nmetrics));
     const nrows = Math.ceil(nmetrics / ncols);
-    const vSpace = Math.min(0.10, 0.5 / nrows);
+    const vSpace = Math.min(0.12, 0.6 / nrows);
     const hSpace = Math.min(0.06, 0.3 / ncols);
     const plotH = (1 - (nrows - 1) * vSpace) / nrows;
     const plotW = (1 - (ncols - 1) * hSpace) / ncols;
     const xDom = c => { const l = c * (plotW + hSpace); return [l, l + plotW]; };
     const yDom = r => { const t = 1 - r * (plotH + vSpace); return [t - plotH, t]; };
-    // lowest panel index in a column (the one that shows the step axis)
-    const colBottomPanel = c => { let r = nrows - 1; while (r * ncols + c >= nmetrics) r--; return r * ncols + c; };
 
-    layout = { annotations: [] };
+    layout = { annotations: [], showlegend: false };
     for (let p = 0; p < nmetrics; p++) {
       const row = Math.floor(p / ncols);
       const col = p % ncols;
@@ -608,18 +622,13 @@ function drawChart(data) {
       const yk = 'yaxis' + (p === 0 ? '' : (p + 1));
       const isColBottom = row === nrows - 1 || (row + 1) * ncols + col >= nmetrics;
 
+      // y axis: own scale per panel; label 'value' only on the leftmost column.
       const yCfg = { domain: [yB, yT], anchor: xName, color: axisColor, gridcolor: gridColor, zerolinecolor: gridColor };
-      if (col === 0) yCfg.title = { text: 'value', font: { color: axisColor } };  // label the y axis once per row
+      if (col === 0) yCfg.title = { text: 'value', font: { color: axisColor } };
       layout[yk] = yCfg;
-
+      // x axis: own range/ticks per panel; label 'step' only at the column bottom.
       const xCfg = { domain: [xL, xR], anchor: yName, color: axisColor, gridcolor: gridColor, zerolinecolor: gridColor };
-      if (isColBottom) {
-        xCfg.title = { text: 'step', font: { color: axisColor } };
-      } else {
-        xCfg.showticklabels = false;
-        const bp = colBottomPanel(col);
-        xCfg.matches = bp === 0 ? 'x' : 'x' + (bp + 1);  // link range to the column's bottom x axis
-      }
+      if (isColBottom) xCfg.title = { text: 'step', font: { color: axisColor } };
       layout[xk] = xCfg;
 
       // subplot title sits just above its panel
@@ -628,8 +637,7 @@ function drawChart(data) {
         yanchor: 'bottom', font: { color: '#cdd6f4', size: 13 }, showarrow: false,
       });
     }
-    layout.legend = { orientation: 'h', y: -0.18, font: { color: '#cdd6f4', size: legendFontSize }, tracegroupgap: 6 };
-    layout.margin = { t: 50, r: 20, b: bottomMargin, l: 60 };
+    layout.margin = { t: 50, r: 20, b: 40, l: 60 };
     layout.hovermode = 'x unified';
     layout.paper_bgcolor = '#1e1e2e';
     layout.plot_bgcolor = '#1e1e2e';
@@ -640,8 +648,8 @@ function drawChart(data) {
       title: { text: metricOrder.join(', '), font: { color: '#cdd6f4', size: 14 } },
       xaxis: xStyle,
       yaxis: yStyle,
-      legend: { orientation: 'h', y: -0.22, font: { color: '#cdd6f4', size: legendFontSize }, tracegroupgap: 8 },
-      margin: { t: 50, r: 20, b: bottomMargin, l: 60 },
+      showlegend: false,
+      margin: { t: 50, r: 20, b: 40, l: 60 },
       hovermode: 'x unified',
       paper_bgcolor: '#1e1e2e',
       plot_bgcolor: '#1e1e2e',
@@ -651,6 +659,41 @@ function drawChart(data) {
   }
 
   Plotly.react('chart', traces, layout, { responsive: true, displaylogo: false });
+  renderLegend(legendItems);
+}
+
+// HTML legend below the chart: one chip per run with its color and the inline
+// last value/step of every selected metric. Chips wrap to fit the page width,
+// and clicking a chip toggles that run's traces on/off.
+function renderLegend(items) {
+  const el = document.getElementById('legend');
+  el.innerHTML = '';
+  el.style.display = items.length ? 'flex' : 'none';
+  items.forEach(it => {
+    const chip = document.createElement('div');
+    chip.className = 'leg-item' + (state.hiddenRuns.has(it.run) ? ' hidden' : '');
+    chip.title = 'click to toggle';
+    const sw = document.createElement('span');
+    sw.className = 'leg-sw';
+    sw.style.background = it.color;
+    chip.appendChild(sw);
+    const nm = document.createElement('span');
+    nm.className = 'leg-name';
+    nm.textContent = it.run;
+    chip.appendChild(nm);
+    it.parts.forEach(pt => {
+      const m = document.createElement('span');
+      m.className = 'leg-metric';
+      m.textContent = `  ${pt.metric}=${pt.value} @ step ${pt.step}`;
+      chip.appendChild(m);
+    });
+    chip.onclick = () => {
+      if (state.hiddenRuns.has(it.run)) state.hiddenRuns.delete(it.run);
+      else state.hiddenRuns.add(it.run);
+      drawChart(state._lastData);
+    };
+    el.appendChild(chip);
+  });
 }
 
 function updateStatus(data) {
