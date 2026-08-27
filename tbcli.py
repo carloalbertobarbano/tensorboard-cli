@@ -227,22 +227,48 @@ def _iter_tfrecord_stride_by_step(
     total_records: int,
     first_step: int = 0,
     step_interval: int = 1,
+    records_per_step: int = 0,
 ) -> Iterator[bytes]:
     """Yield raw event bytes from a TF record file with step-index subsampling.
 
-    Reads all records sequentially (cache-friendly, no seek-syscall overhead).
-    For each record outside the tail region the step field is extracted with a
-    fast partial decode; the record is kept only when its step index (relative
-    to first_step, divided by step_interval) is divisible by stride.
+    Reads all records sequentially (cache-friendly, no seek-syscall overhead)
+    and groups them by step (records for a given step are contiguous in the
+    file). A step's records are kept when any of these holds:
 
-    This makes stride=S mean "keep 1 in S logged steps" regardless of the raw
-    step values used by the training loop.
+      * the record falls in the last ``tail_records`` positions (full fidelity);
+      * the step carries a non-standard number of scalar records
+        (``records_per_step`` is the count at a typical/dense step) — this
+        preserves metrics logged on a sparser cadence than the dense ones,
+        which a plain stride would otherwise drop entirely; or
+      * the step index ``(step - first_step) // step_interval`` is divisible by
+        ``stride`` (the 1-in-S decimation for the dense metrics).
 
-    Records in the last tail_records positions are always yielded (full fidelity).
+    This makes stride=S mean "keep 1 in S dense logged steps" while still
+    keeping every point of any metric logged on a different cadence.
     """
     tail_start = max(0, total_records - tail_records)
+    stride = max(1, stride)
+    interval = step_interval or 1
+
+    def _keep_step(step: Optional[int], count: int) -> bool:
+        # A step whose record count differs from the dense norm carries
+        # sparsely-logged (or missing) metrics — keep it in full so those
+        # metrics aren't lost to the stride decimation.
+        if records_per_step and count != records_per_step:
+            return True
+        if step is None:
+            return True
+        idx = (step - first_step) // interval
+        return idx % stride == 0
+
     with open(path, "rb") as fh:
-        for i in range(total_records):
+        # Buffer records of the current step until the step changes, so the
+        # keep decision can use the step's full record count. One dense step is
+        # at most a few hundred small records, so this is cheap.
+        buf: List[Tuple[int, bytes]] = []
+        cur_step: Optional[int] = None
+        idx = 0
+        for _ in range(total_records):
             header = fh.read(_TF_RECORD_HEADER_BYTES)
             if len(header) < _TF_RECORD_HEADER_BYTES:
                 break
@@ -250,14 +276,22 @@ def _iter_tfrecord_stride_by_step(
             data = fh.read(data_len)
             fh.read(_TF_RECORD_FOOTER_BYTES)
 
-            if i >= tail_start:
-                yield data
-            else:
-                step = _parse_event_step(data)
-                if step is not None:
-                    step_idx = (step - first_step) // step_interval if step_interval > 0 else step
-                    if step_idx % stride == 0:
-                        yield data
+            step = _parse_event_step(data)
+            if step != cur_step and buf:
+                keep = _keep_step(cur_step, len(buf))
+                for gidx, d in buf:
+                    if keep or gidx >= tail_start:
+                        yield d
+                buf = []
+            cur_step = step
+            buf.append((idx, data))
+            idx += 1
+
+        if buf:
+            keep = _keep_step(cur_step, len(buf))
+            for gidx, d in buf:
+                if keep or gidx >= tail_start:
+                    yield d
 
 
 def _find_event_files(run_dir: Path) -> List[str]:
@@ -337,7 +371,7 @@ def load_scalars_fast(
             tail_records = tail * rps
 
             for raw in _iter_tfrecord_stride_by_step(
-                event_file, stride, tail_records, total, first_step, step_interval
+                event_file, stride, tail_records, total, first_step, step_interval, rps
             ):
                 ev = Event()
                 ev.ParseFromString(raw)

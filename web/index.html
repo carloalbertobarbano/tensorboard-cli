@@ -150,12 +150,26 @@
   #no-data { display: none; flex: 1; align-items: center; justify-content: center; color: var(--text-dim); font-size: 14px; }
 
   /* ── HTML legend (wraps long per-run inline entries) ── */
-  #legend {
+  #legend-wrap {
     flex: 0 0 auto;
-    max-height: 34%;
-    overflow-y: auto;
-    padding: 4px 10px;
+    height: 140px;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg);
     border-top: 1px solid var(--border);
+    z-index: 5;
+  }
+  #legend-handle {
+    flex: 0 0 6px;
+    cursor: ns-resize;
+    background: var(--border);
+  }
+  #legend-handle:hover, #legend-handle.dragging { background: var(--accent); }
+  #legend {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 6px 10px;
     display: flex;
     flex-wrap: wrap;
     gap: 4px 10px;
@@ -284,7 +298,10 @@
   </div>
   <div id="chart-wrap">
     <div id="chart"></div>
-    <div id="legend"></div>
+    <div id="legend-wrap">
+      <div id="legend-handle" title="drag to resize"></div>
+      <div id="legend"></div>
+    </div>
     <div id="no-data">No data to display</div>
   </div>
 </div>
@@ -522,7 +539,7 @@ function drawChart(data) {
   const hasSeries = data.series.some(s => s.points.length > 0);
   document.getElementById('chart').style.display = hasSeries ? 'block' : 'none';
   document.getElementById('no-data').style.display = hasSeries ? 'none' : 'flex';
-  document.getElementById('legend').style.display = hasSeries ? 'flex' : 'none';
+  document.getElementById('legend-wrap').style.display = hasSeries ? 'flex' : 'none';
   if (!hasSeries) return;
 
   // Order metrics as the user selected them (fallback to server order).
@@ -590,8 +607,8 @@ function drawChart(data) {
 
   const axisColor = '#6c7086';
   const gridColor = '#3a3a5c';
-  const xStyle = { color: axisColor, gridcolor: gridColor, zerolinecolor: gridColor, title: { text: 'step', font: { color: axisColor } } };
-  const yStyle = { color: axisColor, gridcolor: gridColor, zerolinecolor: gridColor, title: { text: 'value', font: { color: axisColor } } };
+  const xStyle = { color: axisColor, gridcolor: gridColor, zerolinecolor: gridColor, autorange: true, type: 'linear', title: { text: 'step', font: { color: axisColor } } };
+  const yStyle = { color: axisColor, gridcolor: gridColor, zerolinecolor: gridColor, autorange: true, type: 'linear', title: { text: 'value', font: { color: axisColor } } };
 
   let layout;
   if (multiMetric) {
@@ -623,11 +640,11 @@ function drawChart(data) {
       const isColBottom = row === nrows - 1 || (row + 1) * ncols + col >= nmetrics;
 
       // y axis: own scale per panel; label 'value' only on the leftmost column.
-      const yCfg = { domain: [yB, yT], anchor: xName, color: axisColor, gridcolor: gridColor, zerolinecolor: gridColor };
+      const yCfg = { domain: [yB, yT], anchor: xName, color: axisColor, gridcolor: gridColor, zerolinecolor: gridColor, autorange: true, type: 'linear' };
       if (col === 0) yCfg.title = { text: 'value', font: { color: axisColor } };
       layout[yk] = yCfg;
       // x axis: own range/ticks per panel; label 'step' only at the column bottom.
-      const xCfg = { domain: [xL, xR], anchor: yName, color: axisColor, gridcolor: gridColor, zerolinecolor: gridColor };
+      const xCfg = { domain: [xL, xR], anchor: yName, color: axisColor, gridcolor: gridColor, zerolinecolor: gridColor, autorange: true, type: 'linear' };
       if (isColBottom) xCfg.title = { text: 'step', font: { color: axisColor } };
       layout[xk] = xCfg;
 
@@ -658,7 +675,19 @@ function drawChart(data) {
     };
   }
 
-  Plotly.react('chart', traces, layout, { responsive: true, displaylogo: false });
+  // When the metric selection changes, plot from scratch (Plotly.newPlot) so
+  // the previous chart's axis ranges/zoom — which Plotly.react would otherwise
+  // keep on the reused axes — don't bleed into the new panels and make some
+  // curves appear to start at the wrong step. For plain data refreshes (same
+  // metrics), keep Plotly.react so the user's zoom/pan is preserved.
+  const config = { responsive: true, displaylogo: false };
+  const metricKey = metricOrder.join('\n');
+  if (metricKey !== state._lastMetricKey) {
+    Plotly.newPlot('chart', traces, layout, config);
+    state._lastMetricKey = metricKey;
+  } else {
+    Plotly.react('chart', traces, layout, config);
+  }
   renderLegend(legendItems);
 }
 
@@ -695,6 +724,35 @@ function renderLegend(items) {
     el.appendChild(chip);
   });
 }
+
+// Drag the handle above the legend to resize it. Resizing the legend changes
+// the chart's flex height, so we tell Plotly to re-fit after each move.
+(function initLegendResize() {
+  const handle = document.getElementById('legend-handle');
+  const wrap = document.getElementById('legend-wrap');
+  let dragging = false, startY = 0, startH = 0;
+  handle.addEventListener('mousedown', (e) => {
+    dragging = true;
+    startY = e.clientY;
+    startH = wrap.getBoundingClientRect().height;
+    handle.classList.add('dragging');
+    document.body.style.cursor = 'ns-resize';
+    e.preventDefault();
+  });
+  document.addEventListener('mousemove', (e) => {
+    if (!dragging) return;
+    const dy = startY - e.clientY;  // drag up → taller legend
+    const h = Math.max(40, Math.min(window.innerHeight * 0.7, startH + dy));
+    wrap.style.height = h + 'px';
+    if (window.Plotly) Plotly.Plots.resize('chart');
+  });
+  document.addEventListener('mouseup', () => {
+    if (!dragging) return;
+    dragging = false;
+    handle.classList.remove('dragging');
+    document.body.style.cursor = '';
+  });
+})();
 
 function updateStatus(data) {
   document.getElementById('status-time').textContent =
