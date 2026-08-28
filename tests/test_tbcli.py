@@ -122,6 +122,37 @@ class TbCliTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             tbcli.resolve_run_selection(runs, "*nope*")
 
+    def test_discover_new_runs_picks_up_runs_added_after_startup(self):
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            run_a = self._make_run_with_timestamp(tmp, "a", 1000)
+            # Initially only run_a is known to the server.
+            self.assertEqual(tbcli._discover_new_runs(tmp, None, [run_a]), [])
+            # A new run appears in the logdir after startup.
+            run_b = self._make_run_with_timestamp(tmp, "b", 2000)
+            new = tbcli._discover_new_runs(tmp, None, [run_a])
+            self.assertEqual(new, [run_b])
+
+    def test_discover_new_runs_never_drops_existing_runs(self):
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            run_a = self._make_run_with_timestamp(tmp, "a", 1000)
+            # Even though run_a is the only one on disk, passing a superset of
+            # "current" runs (e.g. a since-deleted run) must not return it as new
+            # and must not drop anything — existing runs are kept as-is.
+            ghost = tmp / "ghost"
+            self.assertEqual(tbcli._discover_new_runs(tmp, None, [run_a, ghost]), [])
+
+    def test_discover_new_runs_respects_runs_filter(self):
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            run_a = self._make_run_with_timestamp(tmp, "exp1", 1000)
+            # Two new runs appear, only one matches the --runs pattern.
+            run_b = self._make_run_with_timestamp(tmp, "exp2", 2000)
+            run_c = self._make_run_with_timestamp(tmp, "other", 3000)
+            new = tbcli._discover_new_runs(tmp, "exp*", [run_a])
+            self.assertEqual(new, [run_b])
+
     def test_load_scalars_with_loader(self):
         FakeAccumulator.DATA = {
             "/logs/r1": {"loss": [_event(1, 0.5, 0.0), _event(2, 0.25, 1.0)]}

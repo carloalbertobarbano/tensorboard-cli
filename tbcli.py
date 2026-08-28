@@ -71,6 +71,26 @@ class InteractiveState:
         )
 
 
+def _discover_new_runs(
+    logdir: Path,
+    runs_filter: Optional[str],
+    current_runs: Sequence[Path],
+) -> List[Path]:
+    """Re-scan ``logdir`` and return runs not already in ``current_runs``.
+
+    Used by the web server's background reload to pick up runs created after
+    the server started. ``runs_filter`` applies the same ``--runs`` wildcard
+    patterns (if any) so an unrelated new run doesn't sneak in. Existing runs
+    are never removed — only new ones are returned — so a run the user is
+    viewing is never dropped out from under them.
+    """
+    discovered = discover_runs(logdir)
+    if runs_filter:
+        discovered = filter_runs_by_patterns(discovered, runs_filter)
+    existing = {str(p) for p in current_runs}
+    return [r for r in discovered if str(r) not in existing]
+
+
 def discover_runs(logdir: Path) -> List[Path]:
     runs = []
     seen = set()
@@ -861,12 +881,35 @@ def run_web_server(args: "argparse.Namespace", logdir: Path) -> int:
     Handler._html_page = html_page
 
     def _bg_reload() -> None:
-        """Load data once, signal metrics ready, then keep refreshing on interval."""
+        """Load data once, signal metrics ready, then keep refreshing on interval.
+
+        Each cycle also re-scans ``logdir`` (via :func:`_discover_new_runs`) so
+        runs created after the server started are picked up automatically. Only
+        new runs are appended; runs already tracked are never dropped, so a run
+        the user is viewing stays put. ``--last`` is intentionally not re-applied
+        — a brand-new run is recent by definition and is exactly what
+        auto-detection is meant to surface.
+        """
         while True:
-            new_data = loader(all_run_paths)
+            new_runs = _discover_new_runs(logdir, args.runs, Handler.server_state["all_run_paths"])
+
+            current_runs = Handler.server_state["all_run_paths"]
+            runs_changed = False
+            if new_runs:
+                # Append (never replace) so existing palette indices stay stable —
+                # /api/data keys color off all_run_paths.index(run_path).
+                current_runs = [*current_runs, *new_runs]
+                with data_lock:
+                    Handler.server_state["all_run_paths"] = current_runs
+                runs_changed = True
+
+            new_data = loader(current_runs)
             with data_lock:
                 Handler.server_state["cached_data"] = new_data
-                if not metrics_ready.is_set():
+                # Refresh the metric list on the first load and whenever the run
+                # set changes, so metrics introduced by a newly appeared run show
+                # up in the selector.
+                if not metrics_ready.is_set() or runs_changed:
                     Handler.server_state["all_metrics"] = sorted(
                         {m for run_data in new_data.values() for m in run_data}
                     )
