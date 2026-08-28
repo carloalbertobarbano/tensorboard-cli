@@ -62,6 +62,38 @@
   button:hover { border-color: var(--accent); color: var(--accent); }
   #refresh-btn { padding: 4px 12px; }
 
+  /* ── Metric multi-select dropdown ── */
+  .metric-dropdown { position: relative; }
+  #metric-btn {
+    display: flex; align-items: center; gap: 6px;
+    min-width: 160px; justify-content: space-between;
+  }
+  #metric-btn-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .popover {
+    position: absolute; top: calc(100% + 4px); left: 0;
+    width: 260px; max-height: 320px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 4px;
+    display: flex; flex-direction: column; z-index: 20;
+    box-shadow: 0 6px 20px rgba(0,0,0,0.4);
+  }
+  .popover.hidden { display: none; }
+  #metric-filter {
+    margin: 8px; padding: 4px 8px;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+    color: var(--text); font-size: 12px; outline: none;
+  }
+  #metric-filter:focus { border-color: var(--accent); }
+  #metric-list { overflow-y: auto; flex: 1; padding: 0 0 4px; }
+  .metric-item {
+    display: flex; align-items: center; gap: 8px;
+    padding: 4px 12px; cursor: pointer; transition: background 0.1s;
+  }
+  .metric-item:hover { background: var(--border); }
+  .metric-item input[type=checkbox] { accent-color: var(--accent); cursor: pointer; }
+  .metric-item .metric-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; font-size: 12px; }
+  .metric-actions { display: flex; gap: 6px; padding: 6px 8px 8px; border-top: 1px solid var(--border); }
+  .metric-actions button { flex: 1; font-size: 11px; padding: 3px 8px; }
+
   /* ── Body layout ── */
   #body {
     position: fixed;
@@ -114,8 +146,57 @@
 
   /* ── Chart area ── */
   #chart-wrap { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
-  #chart { flex: 1; }
+  #chart { flex: 1; min-height: 0; }
   #no-data { display: none; flex: 1; align-items: center; justify-content: center; color: var(--text-dim); font-size: 14px; }
+
+  /* ── HTML legend (wraps long per-run inline entries) ── */
+  #legend-wrap {
+    flex: 0 0 auto;
+    height: 140px;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg);
+    border-top: 1px solid var(--border);
+    z-index: 5;
+  }
+  #legend-handle {
+    flex: 0 0 6px;
+    cursor: ns-resize;
+    background: var(--border);
+  }
+  #legend-handle:hover, #legend-handle.dragging { background: var(--accent); }
+  #legend {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 6px 10px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 10px;
+    font-size: 11px;
+    line-height: 1.35;
+    color: var(--text);
+  }
+  .leg-item {
+    display: inline-flex;
+    align-items: flex-start;
+    gap: 5px;
+    max-width: 100%;
+    cursor: pointer;
+    padding: 1px 3px;
+    border-radius: 3px;
+    white-space: normal;
+    word-break: break-word;
+  }
+  .leg-item:hover { background: var(--border); }
+  .leg-item .leg-sw {
+    flex: 0 0 auto;
+    width: 14px; height: 3px;
+    border-radius: 2px;
+    margin-top: 7px;
+  }
+  .leg-item.hidden { opacity: 0.4; text-decoration: line-through; }
+  .leg-metric { color: var(--text-dim); margin-left: 2px; }
 
   /* ── Status bar ── */
   #status {
@@ -165,8 +246,20 @@
 </div>
 
 <div id="toolbar">
-  <label for="metric-sel">Metric</label>
-  <select id="metric-sel" onchange="onMetricChange()"></select>
+  <label>Metric</label>
+  <div class="metric-dropdown">
+    <button id="metric-btn" type="button" onclick="toggleMetricDropdown()">
+      <span id="metric-btn-label">—</span><span>▾</span>
+    </button>
+    <div id="metric-popover" class="popover hidden">
+      <input type="text" id="metric-filter" placeholder="Filter metrics…" autocomplete="off" spellcheck="false">
+      <div id="metric-list"></div>
+      <div class="metric-actions">
+        <button onclick="selectAllMetrics()">All</button>
+        <button onclick="selectNoMetrics()">None</button>
+      </div>
+    </div>
+  </div>
   <label for="refresh-sel">Refresh</label>
   <select id="refresh-sel" onchange="onRefreshChange()">
     <option value="0">off</option>
@@ -205,6 +298,10 @@
   </div>
   <div id="chart-wrap">
     <div id="chart"></div>
+    <div id="legend-wrap">
+      <div id="legend-handle" title="drag to resize"></div>
+      <div id="legend"></div>
+    </div>
     <div id="no-data">No data to display</div>
   </div>
 </div>
@@ -220,14 +317,126 @@ const state = {
   allRuns: [],          // [{id, name, color}]
   selectedRuns: new Set(),
   allMetrics: [],
-  selectedMetric: null,
+  selectedMetrics: [],  // ordered list of metric tags currently plotted
   sortBy: 'name',
   runLimit: 0,          // 0 = all, otherwise last N runs by creation time
+  hiddenRuns: new Set(),  // runs toggled off in the HTML legend
   refreshInterval: __REFRESH_DEFAULT__,
   _timer: null,
   _fetching: false,
   _lastData: null,
+  _storageKey: 'tbcli.workspace',  // scoped per-logdir once /api/runs returns
 };
+
+// Persist the workspace (selected metrics/runs, sort, limits, filters, hidden
+// runs) to localStorage so it survives reloads. Scoped per logdir so selections
+// from one experiment don't bleed into another. All access is wrapped in
+// try/catch: localStorage can be unavailable (private browsing, blocked site
+// storage) — we silently degrade to no persistence in that case.
+function storageKey() { return state._storageKey || 'tbcli.workspace'; }
+
+function saveWorkspace() {
+  try {
+    localStorage.setItem(storageKey(), JSON.stringify({
+      v: 1,
+      selectedMetrics: state.selectedMetrics,
+      selectedRuns: [...state.selectedRuns],
+      hiddenRuns: [...state.hiddenRuns],
+      sortBy: state.sortBy,
+      runLimit: state.runLimit,
+      refreshInterval: state.refreshInterval,
+      runFilter: document.getElementById('run-filter').value,
+    }));
+  } catch { /* storage unavailable or full */ }
+}
+
+function loadWorkspace() {
+  try {
+    const raw = localStorage.getItem(storageKey());
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
+
+function getMetricFilter() {
+  const raw = document.getElementById('metric-filter').value;
+  let regex = null;
+  try { regex = raw ? new RegExp(raw, 'i') : null; } catch { /* invalid */ }
+  return regex;
+}
+
+function buildMetricList() {
+  const el = document.getElementById('metric-list');
+  el.innerHTML = '';
+  const regex = getMetricFilter();
+  const metrics = regex ? state.allMetrics.filter(m => regex.test(m)) : [...state.allMetrics];
+  metrics.forEach(m => {
+    const item = document.createElement('div');
+    item.className = 'metric-item';
+    const checked = state.selectedMetrics.includes(m);
+    item.innerHTML = `
+      <input type="checkbox" ${checked ? 'checked' : ''}>
+      <span class="metric-name" title="${m}">${m}</span>
+    `;
+    item.querySelector('input').addEventListener('change', e => {
+      if (e.target.checked) {
+        if (!state.selectedMetrics.includes(m)) state.selectedMetrics.push(m);
+      } else {
+        state.selectedMetrics = state.selectedMetrics.filter(x => x !== m);
+      }
+      updateMetricButtonLabel();
+      saveWorkspace();
+      refresh();
+    });
+    // Clicking the row toggles the checkbox too.
+    item.addEventListener('click', e => {
+      if (e.target === item || e.target.classList.contains('metric-name')) {
+        const cb = item.querySelector('input');
+        cb.checked = !cb.checked;
+        cb.dispatchEvent(new Event('change'));
+      }
+    });
+    el.appendChild(item);
+  });
+}
+
+function updateMetricButtonLabel() {
+  const label = document.getElementById('metric-btn-label');
+  const n = state.selectedMetrics.length;
+  if (n === 0) label.textContent = '(none)';
+  else if (n === 1) label.textContent = state.selectedMetrics[0];
+  else label.textContent = `${n} metrics`;
+}
+
+function toggleMetricDropdown() {
+  document.getElementById('metric-popover').classList.toggle('hidden');
+}
+
+function closeMetricDropdown() {
+  document.getElementById('metric-popover').classList.add('hidden');
+}
+
+function selectAllMetrics() {
+  const regex = getMetricFilter();
+  const metrics = regex ? state.allMetrics.filter(m => regex.test(m)) : [...state.allMetrics];
+  metrics.forEach(m => { if (!state.selectedMetrics.includes(m)) state.selectedMetrics.push(m); });
+  buildMetricList();
+  updateMetricButtonLabel();
+  saveWorkspace();
+  refresh();
+}
+
+function selectNoMetrics() {
+  const regex = getMetricFilter();
+  if (regex) {
+    state.selectedMetrics = state.selectedMetrics.filter(m => !regex.test(m));
+  } else {
+    state.selectedMetrics = [];
+  }
+  buildMetricList();
+  updateMetricButtonLabel();
+  saveWorkspace();
+  refresh();
+}
 
 function getVisibleRuns() {
   const filterEl = document.getElementById('run-filter');
@@ -272,21 +481,10 @@ function buildRunList() {
     item.querySelector('input').addEventListener('change', e => {
       if (e.target.checked) state.selectedRuns.add(run.id);
       else state.selectedRuns.delete(run.id);
+      saveWorkspace();
       refresh();
     });
     el.appendChild(item);
-  });
-}
-
-function buildMetricDropdown() {
-  const sel = document.getElementById('metric-sel');
-  sel.innerHTML = '';
-  state.allMetrics.forEach(m => {
-    const opt = document.createElement('option');
-    opt.value = m;
-    opt.textContent = m;
-    if (m === state.selectedMetric) opt.selected = true;
-    sel.appendChild(opt);
   });
 }
 
@@ -306,13 +504,16 @@ function syncLimitDropdown() {
   }
 }
 
-function onMetricChange() {
-  state.selectedMetric = document.getElementById('metric-sel').value;
-  refresh();
+function syncSortDropdown() {
+  const sel = document.getElementById('sort-sel');
+  for (const opt of sel.options) {
+    if (opt.value === state.sortBy) { opt.selected = true; break; }
+  }
 }
 
 function onSortChange() {
   state.sortBy = document.getElementById('sort-sel').value;
+  saveWorkspace();
   buildRunList();
   // Reorder the legend without refetching; fall back to a fetch if no data yet.
   if (state._lastData) drawChart(state._lastData);
@@ -321,12 +522,14 @@ function onSortChange() {
 
 function onRefreshChange() {
   state.refreshInterval = Number(document.getElementById('refresh-sel').value);
+  saveWorkspace();
   scheduleAutoRefresh();
 }
 
 function onLimitChange() {
   const val = Number(document.getElementById('limit-sel').value);
   state.runLimit = val === 0 ? 0 : val;
+  saveWorkspace();
   buildRunList();
   refresh();
 }
@@ -352,10 +555,16 @@ async function refresh() {
 }
 
 async function _doRefresh() {
-  if (!state.selectedMetric) return;
+  if (state.selectedMetrics.length === 0) {
+    document.getElementById('chart').style.display = 'none';
+    document.getElementById('no-data').style.display = 'flex';
+    state._lastData = null;
+    return;
+  }
   const visibleIds = new Set(getVisibleRuns().map(r => r.id));
   const runs = [...state.selectedRuns].filter(id => visibleIds.has(id)).join(',');
-  const url = `/api/data?metric=${encodeURIComponent(state.selectedMetric)}&runs=${encodeURIComponent(runs)}`;
+  const metrics = state.selectedMetrics.map(encodeURIComponent).join(',');
+  const url = `/api/data?metrics=${metrics}&runs=${encodeURIComponent(runs)}`;
   const data = await fetch(url).then(r => {
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     return r.json();
@@ -374,45 +583,221 @@ function drawChart(data) {
   const hasSeries = data.series.some(s => s.points.length > 0);
   document.getElementById('chart').style.display = hasSeries ? 'block' : 'none';
   document.getElementById('no-data').style.display = hasSeries ? 'none' : 'flex';
+  document.getElementById('legend-wrap').style.display = hasSeries ? 'flex' : 'none';
   if (!hasSeries) return;
+
+  // Order metrics as the user selected them (fallback to server order).
+  const metricOrder = state.selectedMetrics.length ? state.selectedMetrics : (data.metrics || []);
+  const multiMetric = metricOrder.length > 1;
 
   // Legend follows trace order; sort series to match the sidebar sort.
   const createdMap = Object.fromEntries(state.allRuns.map(r => [r.id, r.created]));
+  const seenRuns = new Set();
+  // Last value/step of every selected metric for each run — used to build the
+  // inline "metric=value @ step ..." legend entry shown once per run.
+  const lastByRun = new Map();
+  data.series.forEach(s => {
+    if (!s.points.length) return;
+    if (!lastByRun.has(s.run)) lastByRun.set(s.run, {});
+    const lp = s.points[s.points.length - 1];
+    lastByRun.get(s.run)[s.metric] = { value: lp.value, step: lp.step };
+  });
+  const hidden = state.hiddenRuns;
+  const legendItems = [];
   const traces = data.series
     .filter(s => s.points.length > 0)
-    .sort((a, b) => runComparator(
-      { name: a.run, created: createdMap[a.run_id] },
-      { name: b.run, created: createdMap[b.run_id] },
-    ))
-    .map(s => ({
-      x: s.points.map(p => p.step),
-      y: s.points.map(p => p.value),
-      name: (() => { const last = s.points[s.points.length - 1]; return `${s.run}  ${last.value.toPrecision(4)} @ step ${last.step}`; })(),
-      mode: 'lines',
-      line: { color: s.color, width: 2 },
-      hovertemplate: `<b>${s.run}</b><br>step=%{x}<br>${data.metric}=%{y:.4f}<extra></extra>`,
-    }));
+    .sort((a, b) => {
+      // Group by metric (in selected order) then by run sort.
+      const ma = metricOrder.indexOf(a.metric), mb = metricOrder.indexOf(b.metric);
+      if (ma !== mb) return ma - mb;
+      return runComparator(
+        { name: a.run, created: createdMap[a.run_id] },
+        { name: b.run, created: createdMap[b.run_id] },
+      );
+    })
+    .map(s => {
+      const last = s.points[s.points.length - 1];
+      const p = metricOrder.indexOf(s.metric);
+      const isFirstForRun = !seenRuns.has(s.run);
+      seenRuns.add(s.run);
+      // Collect one legend entry per run: the run name plus the last
+      // value/step of every selected metric that has data for the run. The
+      // legend is rendered as wrapping HTML below the chart (renderLegend),
+      // so Plotly's own legend is turned off in the layout below.
+      if (isFirstForRun) {
+        const lv = lastByRun.get(s.run) || {};
+        const parts = metricOrder
+          .filter(m => lv[m])
+          .map(m => ({ metric: m, value: lv[m].value.toPrecision(4), step: lv[m].step }));
+        legendItems.push({ run: s.run, color: s.color, parts });
+      }
+      const trace = {
+        x: s.points.map(pt => pt.step),
+        y: s.points.map(pt => pt.value),
+        mode: 'lines',
+        line: { color: s.color, width: 2 },
+        hovertemplate: `<b>${s.run}</b><br>step=%{x}<br>${s.metric}=%{y:.4f}<extra></extra>`,
+        name: s.run,
+        visible: hidden.has(s.run) ? false : true,
+      };
+      if (multiMetric) {
+        // Each metric gets its own subplot; assign the trace to that panel's
+        // x/y axis pair (x/y, x2/y2, …).
+        trace.xaxis = p === 0 ? 'x' : 'x' + (p + 1);
+        trace.yaxis = p === 0 ? 'y' : 'y' + (p + 1);
+      }
+      return trace;
+    });
 
-  const n = traces.length;
-  const legendFontSize = n <= 10 ? 12 : n <= 20 ? 11 : n <= 50 ? 10 : 9;
-  // Horizontal legend: reserve more bottom margin as the run count grows.
-  const bottomMargin = n <= 10 ? 90 : n <= 20 ? 110 : n <= 50 ? 140 : 180;
+  const axisColor = '#6c7086';
+  const gridColor = '#3a3a5c';
+  const xStyle = { color: axisColor, gridcolor: gridColor, zerolinecolor: gridColor, autorange: true, type: 'linear', title: { text: 'step', font: { color: axisColor } } };
+  const yStyle = { color: axisColor, gridcolor: gridColor, zerolinecolor: gridColor, autorange: true, type: 'linear', title: { text: 'value', font: { color: axisColor } } };
 
-  const layout = {
-    title: { text: data.metric, font: { color: '#cdd6f4', size: 14 } },
-    xaxis: { title: { text: 'step', font: { color: '#6c7086' } }, color: '#6c7086', gridcolor: '#3a3a5c', zerolinecolor: '#3a3a5c' },
-    yaxis: { title: { text: 'value', font: { color: '#6c7086' } }, color: '#6c7086', gridcolor: '#3a3a5c', zerolinecolor: '#3a3a5c' },
-    legend: { orientation: 'h', y: -0.22, font: { color: '#cdd6f4', size: legendFontSize } },
-    margin: { t: 50, r: 20, b: bottomMargin, l: 60 },
-    hovermode: 'x unified',
-    paper_bgcolor: '#1e1e2e',
-    plot_bgcolor: '#1e1e2e',
-    font: { color: '#cdd6f4' },
-    hoverlabel: { bgcolor: '#2a2a3e', bordercolor: '#3a3a5c', font: { color: '#cdd6f4' } },
-  };
+  let layout;
+  if (multiMetric) {
+    // Grid of subplots (near-square), one per metric, so panels stay readable
+    // as the metric count grows. Every panel has INDEPENDENT x and y axes (its
+    // own step range and value scale); the 'step' label is printed only on the
+    // bottom panel of each column to avoid repetition. Built by hand — Plotly.js
+    // has no makeSubplots.
+    const nmetrics = metricOrder.length;
+    const ncols = Math.ceil(Math.sqrt(nmetrics));
+    const nrows = Math.ceil(nmetrics / ncols);
+    const vSpace = Math.min(0.12, 0.6 / nrows);
+    const hSpace = Math.min(0.06, 0.3 / ncols);
+    const plotH = (1 - (nrows - 1) * vSpace) / nrows;
+    const plotW = (1 - (ncols - 1) * hSpace) / ncols;
+    const xDom = c => { const l = c * (plotW + hSpace); return [l, l + plotW]; };
+    const yDom = r => { const t = 1 - r * (plotH + vSpace); return [t - plotH, t]; };
 
-  Plotly.react('chart', traces, layout, { responsive: true, displaylogo: false });
+    layout = { annotations: [], showlegend: false };
+    for (let p = 0; p < nmetrics; p++) {
+      const row = Math.floor(p / ncols);
+      const col = p % ncols;
+      const [xL, xR] = xDom(col);
+      const [yB, yT] = yDom(row);
+      const xName = p === 0 ? 'x' : 'x' + (p + 1);
+      const yName = p === 0 ? 'y' : 'y' + (p + 1);
+      const xk = 'xaxis' + (p === 0 ? '' : (p + 1));
+      const yk = 'yaxis' + (p === 0 ? '' : (p + 1));
+      const isColBottom = row === nrows - 1 || (row + 1) * ncols + col >= nmetrics;
+
+      // y axis: own scale per panel; label 'value' only on the leftmost column.
+      const yCfg = { domain: [yB, yT], anchor: xName, color: axisColor, gridcolor: gridColor, zerolinecolor: gridColor, autorange: true, type: 'linear' };
+      if (col === 0) yCfg.title = { text: 'value', font: { color: axisColor } };
+      layout[yk] = yCfg;
+      // x axis: own range/ticks per panel; label 'step' only at the column bottom.
+      const xCfg = { domain: [xL, xR], anchor: yName, color: axisColor, gridcolor: gridColor, zerolinecolor: gridColor, autorange: true, type: 'linear' };
+      if (isColBottom) xCfg.title = { text: 'step', font: { color: axisColor } };
+      layout[xk] = xCfg;
+
+      // subplot title sits just above its panel
+      layout.annotations.push({
+        text: metricOrder[p], x: (xL + xR) / 2, xref: 'paper', y: yT, yref: 'paper',
+        yanchor: 'bottom', font: { color: '#cdd6f4', size: 13 }, showarrow: false,
+      });
+    }
+    layout.margin = { t: 50, r: 20, b: 40, l: 60 };
+    layout.hovermode = 'x unified';
+    layout.paper_bgcolor = '#1e1e2e';
+    layout.plot_bgcolor = '#1e1e2e';
+    layout.font = { color: '#cdd6f4' };
+    layout.hoverlabel = { bgcolor: '#2a2a3e', bordercolor: '#3a3a5c', font: { color: '#cdd6f4' } };
+  } else {
+    layout = {
+      title: { text: metricOrder.join(', '), font: { color: '#cdd6f4', size: 14 } },
+      xaxis: xStyle,
+      yaxis: yStyle,
+      showlegend: false,
+      margin: { t: 50, r: 20, b: 40, l: 60 },
+      hovermode: 'x unified',
+      paper_bgcolor: '#1e1e2e',
+      plot_bgcolor: '#1e1e2e',
+      font: { color: '#cdd6f4' },
+      hoverlabel: { bgcolor: '#2a2a3e', bordercolor: '#3a3a5c', font: { color: '#cdd6f4' } },
+    };
+  }
+
+  // When the metric selection changes, plot from scratch (Plotly.newPlot) so
+  // the previous chart's axis ranges/zoom — which Plotly.react would otherwise
+  // keep on the reused axes — don't bleed into the new panels and make some
+  // curves appear to start at the wrong step. For plain data refreshes (same
+  // metrics), keep Plotly.react so the user's zoom/pan is preserved.
+  const config = { responsive: true, displaylogo: false };
+  const metricKey = metricOrder.join('\n');
+  if (metricKey !== state._lastMetricKey) {
+    Plotly.newPlot('chart', traces, layout, config);
+    state._lastMetricKey = metricKey;
+  } else {
+    Plotly.react('chart', traces, layout, config);
+  }
+  renderLegend(legendItems);
 }
+
+// HTML legend below the chart: one chip per run with its color and the inline
+// last value/step of every selected metric. Chips wrap to fit the page width,
+// and clicking a chip toggles that run's traces on/off.
+function renderLegend(items) {
+  const el = document.getElementById('legend');
+  el.innerHTML = '';
+  el.style.display = items.length ? 'flex' : 'none';
+  items.forEach(it => {
+    const chip = document.createElement('div');
+    chip.className = 'leg-item' + (state.hiddenRuns.has(it.run) ? ' hidden' : '');
+    chip.title = 'click to toggle';
+    const sw = document.createElement('span');
+    sw.className = 'leg-sw';
+    sw.style.background = it.color;
+    chip.appendChild(sw);
+    const nm = document.createElement('span');
+    nm.className = 'leg-name';
+    nm.textContent = it.run;
+    chip.appendChild(nm);
+    it.parts.forEach(pt => {
+      const m = document.createElement('span');
+      m.className = 'leg-metric';
+      m.textContent = `  ${pt.metric}=${pt.value} @ step ${pt.step}`;
+      chip.appendChild(m);
+    });
+    chip.onclick = () => {
+      if (state.hiddenRuns.has(it.run)) state.hiddenRuns.delete(it.run);
+      else state.hiddenRuns.add(it.run);
+      saveWorkspace();
+      drawChart(state._lastData);
+    };
+    el.appendChild(chip);
+  });
+}
+
+// Drag the handle above the legend to resize it. Resizing the legend changes
+// the chart's flex height, so we tell Plotly to re-fit after each move.
+(function initLegendResize() {
+  const handle = document.getElementById('legend-handle');
+  const wrap = document.getElementById('legend-wrap');
+  let dragging = false, startY = 0, startH = 0;
+  handle.addEventListener('mousedown', (e) => {
+    dragging = true;
+    startY = e.clientY;
+    startH = wrap.getBoundingClientRect().height;
+    handle.classList.add('dragging');
+    document.body.style.cursor = 'ns-resize';
+    e.preventDefault();
+  });
+  document.addEventListener('mousemove', (e) => {
+    if (!dragging) return;
+    const dy = startY - e.clientY;  // drag up → taller legend
+    const h = Math.max(40, Math.min(window.innerHeight * 0.7, startH + dy));
+    wrap.style.height = h + 'px';
+    if (window.Plotly) Plotly.Plots.resize('chart');
+  });
+  document.addEventListener('mouseup', () => {
+    if (!dragging) return;
+    dragging = false;
+    handle.classList.remove('dragging');
+    document.body.style.cursor = '';
+  });
+})();
 
 function updateStatus(data) {
   document.getElementById('status-time').textContent =
@@ -427,12 +812,14 @@ function setErr(msg) {
 function selectAll() {
   getVisibleRuns().forEach(r => state.selectedRuns.add(r.id));
   buildRunList();
+  saveWorkspace();
   refresh();
 }
 
 function selectNone() {
   getVisibleRuns().forEach(r => state.selectedRuns.delete(r.id));
   buildRunList();
+  saveWorkspace();
   refresh();
 }
 
@@ -465,14 +852,49 @@ document.addEventListener('DOMContentLoaded', async () => {
   info.runs.forEach((r, i) => { r.color = PALETTE[i % PALETTE.length]; });
   state.allRuns = info.runs;
   state.allMetrics = info.metrics;
-  state.selectedMetric = info.metrics[0] ?? null;
-  state.selectedRuns = new Set(info.runs.map(r => r.id));
 
-  document.getElementById('run-filter').addEventListener('input', () => { buildRunList(); refresh(); });
+  // Restore the persisted workspace for this logdir. Metrics/runs that no
+  // longer exist are dropped (order preserved); if nothing usable survives we
+  // fall back to today's defaults (first metric, all runs).
+  state._storageKey = (info.logdir ? 'tbcli.workspace:' + info.logdir : 'tbcli.workspace');
+  const ws = loadWorkspace();
+  const knownMetrics = new Set(state.allMetrics);
+  if (ws && Array.isArray(ws.selectedMetrics)) {
+    state.selectedMetrics = ws.selectedMetrics.filter(m => knownMetrics.has(m));
+  }
+  if (!state.selectedMetrics.length) state.selectedMetrics = state.allMetrics.slice(0, 1);
+
+  const knownRunIds = new Set(state.allRuns.map(r => r.id));
+  if (ws && Array.isArray(ws.selectedRuns)) {
+    state.selectedRuns = new Set(ws.selectedRuns.filter(id => knownRunIds.has(id)));
+  } else {
+    state.selectedRuns = new Set(state.allRuns.map(r => r.id));
+  }
+
+  if (ws) {
+    if (ws.sortBy) state.sortBy = ws.sortBy;
+    if (typeof ws.runLimit === 'number') state.runLimit = ws.runLimit;
+    if (typeof ws.refreshInterval === 'number') state.refreshInterval = ws.refreshInterval;
+    if (Array.isArray(ws.hiddenRuns)) state.hiddenRuns = new Set(ws.hiddenRuns);
+    if (typeof ws.runFilter === 'string') document.getElementById('run-filter').value = ws.runFilter;
+  }
+
+  document.getElementById('run-filter').addEventListener('input', () => { saveWorkspace(); buildRunList(); refresh(); });
+  document.getElementById('metric-filter').addEventListener('input', () => { buildMetricList(); });
+  // Close the metric popover on outside clicks.
+  document.addEventListener('click', e => {
+    const pop = document.getElementById('metric-popover');
+    if (pop.classList.contains('hidden')) return;
+    if (!pop.contains(e.target) && e.target.id !== 'metric-btn' && !document.getElementById('metric-btn').contains(e.target)) {
+      closeMetricDropdown();
+    }
+  });
   buildRunList();
-  buildMetricDropdown();
+  buildMetricList();
+  updateMetricButtonLabel();
   syncRefreshDropdown();
   syncLimitDropdown();
+  syncSortDropdown();
   overlay.classList.add('hidden');
   await refresh();
   scheduleAutoRefresh();

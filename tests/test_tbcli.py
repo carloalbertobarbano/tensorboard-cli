@@ -659,5 +659,176 @@ class FastLoadTests(unittest.TestCase):
         self.assertEqual(vals[3]["value"], 0.5)
 
 
+def _envarint(n: int) -> bytes:
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        if n:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            break
+    return bytes(out)
+
+
+def _encode_scalar_event(step: int, tag: str, value: float = 0.0, wall_time: float = 1.0) -> bytes:
+    """Hand-encode a minimal scalar Event proto without depending on tensorboard.
+
+    Matches the layout _parse_event_step and tensorboard's Event parser expect:
+      field 1 wall_time (fixed64) | field 2 step (varint) | field 5 summary
+    with Summary.Value: field 1 tag (string) | field 2 simple_value (fixed32).
+    """
+    tag_bytes = tag.encode("utf-8")
+    value_msg = b"\x0a" + _envarint(len(tag_bytes)) + tag_bytes + b"\x15" + struct.pack("<f", value)
+    summary_msg = b"\x0a" + _envarint(len(value_msg)) + value_msg
+    return (
+        b"\x09" + struct.pack("<d", wall_time)
+        + b"\x10" + _envarint(step)
+        + b"\x2a" + _envarint(len(summary_msg)) + summary_msg
+    )
+
+
+def _rd_varint(data: bytes, pos: int):
+    result, shift = 0, 0
+    while True:
+        b = data[pos]; pos += 1
+        result |= (b & 0x7F) << shift
+        shift += 7
+        if not (b & 0x80):
+            return result, pos
+
+
+def _decode_value(data: bytes):
+    pos, tag, value = 0, None, None
+    while pos < len(data):
+        key, pos = _rd_varint(data, pos)
+        field, wire = key >> 3, key & 7
+        if wire == 0:
+            _, pos = _rd_varint(data, pos)
+        elif wire == 2:
+            ln, pos = _rd_varint(data, pos)
+            if field == 1:
+                tag = data[pos:pos + ln].decode("utf-8")
+            pos += ln
+        elif wire == 5:
+            if field == 2:
+                value = struct.unpack("<f", data[pos:pos + 4])[0]
+            pos += 4
+        elif wire == 1:
+            pos += 8
+    return tag, value
+
+
+def _decode_summary(data: bytes):
+    pos, tag, value = 0, None, None
+    while pos < len(data):
+        key, pos = _rd_varint(data, pos)
+        field, wire = key >> 3, key & 7
+        if wire == 2:
+            ln, pos = _rd_varint(data, pos)
+            if field == 1:
+                tag, value = _decode_value(data[pos:pos + ln])
+            pos += ln
+        else:
+            break
+    return tag, value
+
+
+def _decode_event(data: bytes):
+    """Inverse of _encode_scalar_event -> (step, tag, value). No tensorboard needed."""
+    pos, step, tag, value = 0, 0, None, None
+    while pos < len(data):
+        key, pos = _rd_varint(data, pos)
+        field, wire = key >> 3, key & 7
+        if wire == 0:
+            v, pos = _rd_varint(data, pos)
+            if field == 2:
+                step = v
+        elif wire == 1:
+            pos += 8
+        elif wire == 5:
+            pos += 4
+        elif wire == 2:
+            ln, pos = _rd_varint(data, pos)
+            if field == 5:
+                tag, value = _decode_summary(data[pos:pos + ln])
+            pos += ln
+    return step, tag, value
+
+
+def _write_hand_events_file(path: str, records) -> None:
+    """Write a TF events file from (step, tag, value) triples without tensorboard."""
+    with open(path, "wb") as fh:
+        for step, tag, value in records:
+            _write_fake_tfrecord(fh, _encode_scalar_event(step, tag, float(value)))
+
+
+class CadenceFastLoadTests(unittest.TestCase):
+    """Regression tests for the cadence-aware stride subsampling.
+
+    These run without tensorboard installed: they feed hand-encoded TFRecord
+    bytes straight into _iter_tfrecord_stride_by_step, which is the function
+    the cadence bug lived in.
+    """
+
+    def _make_file(self, records):
+        td = tempfile.mkdtemp()
+        path = Path(td) / "events.out.tfevents.0000.host.0.0"
+        _write_hand_events_file(str(path), records)
+        return str(path)
+
+    def test_sparse_cadence_metric_keeps_full_history(self):
+        # Dense metrics (loss, acc, lr) are logged every step -> 3 records/step.
+        # A sparse metric "sp" is logged only at steps 20, 50, 80, so those steps
+        # carry 4 records instead of the dense norm of 3. With stride=3 a naive
+        # step-index % stride filter would drop steps 20/50/80 (indices 2/5/8, none
+        # divisible by 3), erasing all of "sp"'s history. The cadence-aware loader
+        # must keep those atypical steps in full.
+        records = []
+        for i in range(10):
+            s = i * 10
+            records.append((s, "loss", float(i)))
+            records.append((s, "acc", float(i) * 0.1))
+            records.append((s, "lr", float(i) * 0.01))
+        for s, v in [(20, 1.0), (50, 2.0), (80, 3.0)]:
+            records.append((s, "sp", float(v)))
+        path = self._make_file(records)
+        total = tbcli._count_tfrecord_events(path)
+
+        yielded = list(tbcli._iter_tfrecord_stride_by_step(
+            path, stride=3, tail_records=0, total_records=total,
+            first_step=0, step_interval=10, records_per_step=3,
+        ))
+
+        by_tag = {}
+        for raw in yielded:
+            step, tag, _ = _decode_event(raw)
+            by_tag.setdefault(tag, []).append(step)
+
+        # Dense metrics: decimated to step indices 0, 3, 6, 9 -> steps 0,30,60,90.
+        self.assertEqual(sorted(set(by_tag["loss"])), [0, 30, 60, 90])
+        self.assertEqual(sorted(set(by_tag["acc"])), [0, 30, 60, 90])
+        self.assertEqual(sorted(set(by_tag["lr"])), [0, 30, 60, 90])
+        # Sparse metric: ALL of its history survives the decimation.
+        self.assertEqual(sorted(by_tag["sp"]), [20, 50, 80])
+
+    def test_dense_only_run_decimates_and_keeps_tail(self):
+        # Sanity: with no sparse metric, stride decimates evenly and the tail is
+        # kept at full fidelity.
+        records = [(i * 10, "loss", float(i)) for i in range(10)]
+        path = self._make_file(records)
+        total = tbcli._count_tfrecord_events(path)
+
+        yielded = list(tbcli._iter_tfrecord_stride_by_step(
+            path, stride=2, tail_records=2, total_records=total,
+            first_step=0, step_interval=10, records_per_step=1,
+        ))
+        steps = sorted({tbcli._parse_event_step(r) for r in yielded})
+        # stride=2 keeps indices 0,2,4,6,8 -> steps 0,20,40,60,80;
+        # tail_records=2 keeps the last two records -> steps 80,90.
+        self.assertEqual(steps, [0, 20, 40, 60, 80, 90])
+
+
 if __name__ == "__main__":
     unittest.main()
