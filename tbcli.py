@@ -866,7 +866,15 @@ def run_web_server(args: "argparse.Namespace", logdir: Path) -> int:
 
     # Build a concrete handler class by mixing TBRequestHandler with BaseHTTPRequestHandler
     class Handler(TBRequestHandler, http.server.BaseHTTPRequestHandler):
-        pass
+        def handle_one_request(self):
+            # A browser that reloads/cancels the page mid-response resets the
+            # socket; that surfaces here as ECONNRESET/EPIPE while writing the
+            # body. Harmless — swallow it so socketserver doesn't print a
+            # scary traceback that reads like a server crash.
+            try:
+                super().handle_one_request()
+            except (ConnectionResetError, BrokenPipeError):
+                self.close_connection = True
 
     Handler.server_state = {
         "all_run_paths": all_run_paths,
