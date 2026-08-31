@@ -91,7 +91,7 @@ In `--web` mode the `--runs` flag takes comma-separated wildcard patterns (fnmat
 uv run tbcli.py /path/to/logdir --web --runs '*exp1*,2024*'
 ```
 
-The web UI refreshes from disk in the background on the `--refresh` interval (default 5s), so new points show up live without reloading the page.
+The web UI refreshes from disk in the background on the `--refresh` interval (default 5s), so new points show up live without reloading the page. Runs created after the server started are detected automatically on the same interval and added to the run list (selected by default); there is no need to restart tbcli. When `--runs` patterns are set, only new runs matching those patterns are picked up.
 
 ### Web UI flags
 

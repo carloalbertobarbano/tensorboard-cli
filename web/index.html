@@ -537,21 +537,72 @@ function onLimitChange() {
 function scheduleAutoRefresh() {
   clearInterval(state._timer);
   if (state.refreshInterval > 0) {
-    state._timer = setInterval(refresh, state.refreshInterval * 1000);
+    state._timer = setInterval(autoRefreshTick, state.refreshInterval * 1000);
   }
 }
 
 async function refresh() {
+  await _refreshWithSync(false);
+}
+
+// Periodic tick: re-fetch the run list (to pick up newly created runs) then the
+// data. Manual refreshes and interaction-driven refreshes skip the run-list
+// fetch and only reload data, so toggling a checkbox doesn't spam /api/runs.
+async function autoRefreshTick() {
+  await _refreshWithSync(true);
+}
+
+async function _refreshWithSync(syncRunsFirst) {
   if (state._fetching) return;
   state._fetching = true;
   setErr('');
   try {
+    if (syncRunsFirst) await syncRuns();
     await _doRefresh();
   } catch (e) {
     setErr('Fetch error: ' + e.message);
   } finally {
     state._fetching = false;
   }
+}
+
+// Re-fetch /api/runs and merge in any runs created since the page loaded. New
+// runs are appended (preserving existing order/colors) and selected by default
+// so they show up immediately; the run/metric lists are rebuilt only when the
+// sets actually change, avoiding focus/scroll disruption on every tick.
+async function syncRuns() {
+  const info = await fetch('/api/runs').then(r => {
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return r.json();
+  });
+
+  const known = new Set(state.allRuns.map(r => r.id));
+  let runsChanged = false;
+  for (const r of info.runs) {
+    if (known.has(r.id)) continue;
+    // Color is keyed by index in the run list (matches the server's
+    // all_run_paths.index(run_path) palette assignment), so use the current
+    // length — the index this new run will occupy — before appending.
+    r.color = PALETTE[state.allRuns.length % PALETTE.length];
+    state.allRuns.push(r);
+    state.selectedRuns.add(r.id);  // auto-select newly discovered runs
+    runsChanged = true;
+  }
+
+  const knownMetrics = new Set(state.allMetrics);
+  let metricsChanged = false;
+  for (const m of (info.metrics || [])) {
+    if (!knownMetrics.has(m)) {
+      state.allMetrics.push(m);
+      metricsChanged = true;
+    }
+  }
+
+  if (runsChanged) {
+    buildRunList();
+    saveWorkspace();
+  }
+  if (metricsChanged) buildMetricList();
 }
 
 async function _doRefresh() {
