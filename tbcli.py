@@ -71,12 +71,30 @@ class InteractiveState:
         )
 
 
+def discover_all_runs(logdirs: Sequence[Path]) -> List[Path]:
+    """Discover runs across multiple log directories, deduplicated by path.
+
+    Nested/overlapping directories are fine: a run found via two roots is
+    listed once. Order is each directory's sorted discovery order in turn, so
+    index-based selection stays deterministic.
+    """
+    seen: Set[str] = set()
+    runs: List[Path] = []
+    for logdir in logdirs:
+        for run in discover_runs(logdir):
+            key = str(run)
+            if key not in seen:
+                seen.add(key)
+                runs.append(run)
+    return runs
+
+
 def _discover_new_runs(
-    logdir: Path,
+    logdirs: Sequence[Path],
     runs_filter: Optional[str],
     current_runs: Sequence[Path],
 ) -> List[Path]:
-    """Re-scan ``logdir`` and return runs not already in ``current_runs``.
+    """Re-scan ``logdirs`` and return runs not already in ``current_runs``.
 
     Used by the web server's background reload to pick up runs created after
     the server started. ``runs_filter`` applies the same ``--runs`` wildcard
@@ -84,7 +102,7 @@ def _discover_new_runs(
     are never removed — only new ones are returned — so a run the user is
     viewing is never dropped out from under them.
     """
-    discovered = discover_runs(logdir)
+    discovered = discover_all_runs(logdirs)
     if runs_filter:
         discovered = filter_runs_by_patterns(discovered, runs_filter)
     existing = {str(p) for p in current_runs}
@@ -827,14 +845,17 @@ class TBRequestHandler:
         pass  # suppress per-request access log
 
 
-def run_web_server(args: "argparse.Namespace", logdir: Path) -> int:
+def run_web_server(args: "argparse.Namespace", logdirs: Sequence[Path]) -> int:
     import http.server
     import webbrowser
     import functools
 
-    all_run_paths = discover_runs(logdir)
+    all_run_paths = discover_all_runs(logdirs)
     if not all_run_paths:
-        print(f"No TensorBoard runs found in {logdir}", file=sys.stderr)
+        print(
+            f"No TensorBoard runs found in {', '.join(str(d) for d in logdirs)}",
+            file=sys.stderr,
+        )
         return 1
 
     all_run_paths = limit_to_most_recent_runs(all_run_paths, args.last)
@@ -843,7 +864,8 @@ def run_web_server(args: "argparse.Namespace", logdir: Path) -> int:
         all_run_paths = filter_runs_by_patterns(all_run_paths, args.runs)
         if not all_run_paths:
             print(
-                f"No runs match --runs {args.runs!r} in {logdir}",
+                f"No runs match --runs {args.runs!r} in "
+                f"{', '.join(str(d) for d in logdirs)}",
                 file=sys.stderr,
             )
             return 1
@@ -880,7 +902,7 @@ def run_web_server(args: "argparse.Namespace", logdir: Path) -> int:
         "all_run_paths": all_run_paths,
         "loader": loader,
         "args": args,
-        "logdir": str(logdir),
+        "logdir": ", ".join(str(d) for d in logdirs),
         "all_metrics": [],
         "cached_data": {},
         "metrics_ready": metrics_ready,
@@ -891,7 +913,8 @@ def run_web_server(args: "argparse.Namespace", logdir: Path) -> int:
     def _bg_reload() -> None:
         """Load data once, signal metrics ready, then keep refreshing on interval.
 
-        Each cycle also re-scans ``logdir`` (via :func:`_discover_new_runs`) so
+        Each cycle also re-scans the log directories (via
+        :func:`_discover_new_runs`) so
         runs created after the server started are picked up automatically. Only
         new runs are appended; runs already tracked are never dropped, so a run
         the user is viewing stays put. ``--last`` is intentionally not re-applied
@@ -899,7 +922,7 @@ def run_web_server(args: "argparse.Namespace", logdir: Path) -> int:
         auto-detection is meant to surface.
         """
         while True:
-            new_runs = _discover_new_runs(logdir, args.runs, Handler.server_state["all_run_paths"])
+            new_runs = _discover_new_runs(logdirs, args.runs, Handler.server_state["all_run_paths"])
 
             current_runs = Handler.server_state["all_run_paths"]
             runs_changed = False
@@ -982,7 +1005,13 @@ def _render_latest(
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Minimal TensorBoard log viewer")
-    parser.add_argument("logdir", help="TensorBoard log directory")
+    parser.add_argument(
+        "logdirs",
+        nargs="+",
+        metavar="logdir",
+        help="One or more TensorBoard log directories; runs from all of them "
+             "are combined (overlapping directories are deduplicated)",
+    )
     parser.add_argument(
         "--runs",
         help="Comma-separated run selectors, applied in both CLI and --web "
@@ -1121,15 +1150,19 @@ def _render_once(
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
-    logdir = Path(args.logdir).expanduser().resolve()
-    if not logdir.exists():
-        print(f"Directory does not exist: {logdir}", file=sys.stderr)
+    logdirs = [Path(d).expanduser().resolve() for d in args.logdirs]
+    missing = [d for d in logdirs if not d.exists()]
+    if missing:
+        print(
+            f"Directory does not exist: {', '.join(str(d) for d in missing)}",
+            file=sys.stderr,
+        )
         return 2
 
     if args.web:
-        return run_web_server(args, logdir)
+        return run_web_server(args, logdirs)
 
-    all_runs = discover_runs(logdir)
+    all_runs = discover_all_runs(logdirs)
     all_runs = limit_to_most_recent_runs(all_runs, args.last)
     try:
         selected_runs = _resolve_selected_runs(all_runs, args.runs)

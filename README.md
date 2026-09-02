@@ -51,6 +51,9 @@ uv run tbcli.py /path/to/logdir --runs all --metric loss --refresh 2
 # select runs by wildcard pattern (fnmatch, matched against name or path)
 uv run tbcli.py /path/to/logdir --runs '*exp1*,2024*' --metric loss
 
+# combine runs from multiple log directories (overlaps are deduplicated)
+uv run tbcli.py /path/to/logdir1 /path/to/logdir2
+
 # mix indexes and patterns
 uv run tbcli.py /path/to/logdir --runs '1,3,*exp*' --metric loss
 

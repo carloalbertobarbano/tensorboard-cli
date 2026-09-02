@@ -127,10 +127,10 @@ class TbCliTests(unittest.TestCase):
             tmp = Path(tmp_str)
             run_a = self._make_run_with_timestamp(tmp, "a", 1000)
             # Initially only run_a is known to the server.
-            self.assertEqual(tbcli._discover_new_runs(tmp, None, [run_a]), [])
+            self.assertEqual(tbcli._discover_new_runs([tmp], None, [run_a]), [])
             # A new run appears in the logdir after startup.
             run_b = self._make_run_with_timestamp(tmp, "b", 2000)
-            new = tbcli._discover_new_runs(tmp, None, [run_a])
+            new = tbcli._discover_new_runs([tmp], None, [run_a])
             self.assertEqual(new, [run_b])
 
     def test_discover_new_runs_never_drops_existing_runs(self):
@@ -141,7 +141,7 @@ class TbCliTests(unittest.TestCase):
             # "current" runs (e.g. a since-deleted run) must not return it as new
             # and must not drop anything — existing runs are kept as-is.
             ghost = tmp / "ghost"
-            self.assertEqual(tbcli._discover_new_runs(tmp, None, [run_a, ghost]), [])
+            self.assertEqual(tbcli._discover_new_runs([tmp], None, [run_a, ghost]), [])
 
     def test_discover_new_runs_respects_runs_filter(self):
         with tempfile.TemporaryDirectory() as tmp_str:
@@ -150,7 +150,7 @@ class TbCliTests(unittest.TestCase):
             # Two new runs appear, only one matches the --runs pattern.
             run_b = self._make_run_with_timestamp(tmp, "exp2", 2000)
             run_c = self._make_run_with_timestamp(tmp, "other", 3000)
-            new = tbcli._discover_new_runs(tmp, "exp*", [run_a])
+            new = tbcli._discover_new_runs([tmp], "exp*", [run_a])
             self.assertEqual(new, [run_b])
 
     def test_load_scalars_with_loader(self):
