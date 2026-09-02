@@ -197,6 +197,10 @@
   }
   .leg-item.hidden { opacity: 0.4; text-decoration: line-through; }
   .leg-metric { color: var(--text-dim); margin-left: 2px; }
+  /* While one run is hovered, its chip stays bright and the rest fade. */
+  #legend.dimmed .leg-item:not(.active) { opacity: 0.3; }
+  .leg-item.active { background: var(--border); }
+  .leg-item.active .leg-name { color: var(--accent); }
 
   /* ── Status bar ── */
   #status {
@@ -326,6 +330,8 @@ const state = {
   _fetching: false,
   _lastData: null,
   _storageKey: 'tbcli.workspace',  // scoped per-logdir once /api/runs returns
+  _hoverRun: null,       // run currently highlighted from a legend hover
+  _baseAnnotations: [],  // subplot-title annotations, before hover ones are added
 };
 
 // Persist the workspace (selected metrics/runs, sort, limits, filters, hidden
@@ -775,6 +781,11 @@ function drawChart(data) {
   // keep on the reused axes — don't bleed into the new panels and make some
   // curves appear to start at the wrong step. For plain data refreshes (same
   // metrics), keep Plotly.react so the user's zoom/pan is preserved.
+  // Remember the subplot-title annotations so highlightRun() can rebuild the
+  // layout's annotation array (titles + per-run final-value callouts) without
+  // losing the titles.
+  state._baseAnnotations = (layout.annotations || []).map(a => ({ ...a }));
+
   const config = { responsive: true, displaylogo: false };
   const metricKey = metricOrder.join('\n');
   if (metricKey !== state._lastMetricKey) {
@@ -784,6 +795,9 @@ function drawChart(data) {
     Plotly.react('chart', traces, layout, config);
   }
   renderLegend(legendItems);
+  // A redraw (auto-refresh, legend toggle) clears any hover highlight —
+  // re-apply it if the pointer is still resting on a legend chip.
+  if (state._hoverRun) highlightRun(state._hoverRun);
 }
 
 // HTML legend below the chart: one chip per run with its color and the inline
@@ -797,6 +811,7 @@ function renderLegend(items) {
     const chip = document.createElement('div');
     chip.className = 'leg-item' + (state.hiddenRuns.has(it.run) ? ' hidden' : '');
     chip.title = 'click to toggle';
+    chip.dataset.run = it.run;
     const sw = document.createElement('span');
     sw.className = 'leg-sw';
     sw.style.background = it.color;
@@ -817,7 +832,65 @@ function renderLegend(items) {
       saveWorkspace();
       drawChart(state._lastData);
     };
+    // Hovering a chip highlights that run's curve in every plot and dims
+    // all the others; leaving the chip restores the normal view.
+    chip.onmouseenter = () => highlightRun(it.run);
+    chip.onmouseleave = () => highlightRun(null);
     el.appendChild(chip);
+  });
+}
+
+// Highlight (or, with null, restore) one run across every subplot: its traces
+// stay at full opacity and get a thicker line while all other traces fade out;
+// a callout annotation marks the run's final value in each plot it appears in.
+function highlightRun(run) {
+  state._hoverRun = run;
+  const gd = document.getElementById('chart');
+  const legend = document.getElementById('legend');
+  if (!window.Plotly || !gd || !gd.data) return;
+  if (legend) dimLegendChips(run);
+
+  const isDimmed = t => run && t.name !== run;
+  Plotly.restyle(gd, {
+    opacity: gd.data.map(t => isDimmed(t) ? 0.12 : 1),
+    'line.width': gd.data.map(t => t.name === run ? 3 : 2),
+  });
+
+  const valueAnns = [];
+  if (run) {
+    gd.data.forEach(t => {
+      // Only the hovered run, only traces that are actually drawn — no
+      // callout for curves toggled off in the legend or empty panels.
+      if (t.name !== run || t.visible === false || !t.x || !t.x.length) return;
+      valueAnns.push({
+        x: t.x[t.x.length - 1],
+        y: t.y[t.y.length - 1],
+        xref: t.xaxis || 'x',
+        yref: t.yaxis || 'y',
+        text: `${fmtValue(t.y[t.y.length - 1])} @ step ${t.x[t.x.length - 1]}`,
+        showarrow: true, arrowhead: 2, arrowsize: 0.8, arrowwidth: 1.5,
+        ax: -35, ay: -30,
+        arrowcolor: t.line.color,
+        font: { color: t.line.color, size: 11 },
+        bgcolor: '#2a2a3e', bordercolor: t.line.color, borderwidth: 1, borderpad: 3,
+      });
+    });
+  }
+  Plotly.relayout(gd, 'annotations', [...state._baseAnnotations, ...valueAnns]);
+}
+
+// Same precision as the inline legend values, so the callout matches what the
+// chip below the chart shows.
+function fmtValue(v) {
+  return Number(v).toPrecision(4);
+}
+
+// Fades every legend chip except the hovered run's.
+function dimLegendChips(run) {
+  const legend = document.getElementById('legend');
+  legend.classList.toggle('dimmed', !!run);
+  legend.querySelectorAll('.leg-item').forEach(chip => {
+    chip.classList.toggle('active', chip.dataset.run === run);
   });
 }
 
